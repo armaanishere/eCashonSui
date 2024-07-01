@@ -1,0 +1,7 @@
+[config]
+rpc = "http://127.0.0.1:9000"
+
+[packages]
+Examples = { local = "../move/examples" }
+Sui = { local = "../../../crates/sui-framework/packages/sui-framework" }
+MoveStdlib = { local = "../../../crates/sui-framework/packages/move-stdlib" }
