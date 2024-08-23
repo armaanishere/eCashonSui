@@ -972,7 +972,7 @@ pnpm install --ignore-workspace
 pnpm db:setup:dev
 ```
 
-3. [Publish the contract & demo data](#demo-data)
+3. [Publish the contract and demo data](#demo-data)
 
 4. Run both the API and the indexer
 
@@ -982,11 +982,11 @@ pnpm dev
 
 5. Visit [http://localhost:3000/escrows](http://localhost:3000/escrows) or [http://localhost:3000/locked](http://localhost:3000/locked)
 
-### Demo Data<a name="demo-data"></a> {#demo-data}
+### Demo data {#demo-data}
 
 {@include: ../../../snippets/initialize-sui-client-cli.mdx}
 
-Next, configure the Sui CLI to use `testnet` as the active environment, as well. If you haven't already set up a `testnet` environment, do so by running the following command in a terminal or console:
+Next, configure the Sui CLI to use `testnet` as the active environment. If you haven't already set up a `testnet` environment, do so by running the following command in a terminal or console:
 
 ```bash
 sui client new-env --alias testnet --rpc https://fullnode.testnet.sui.io:443
@@ -1160,7 +1160,7 @@ Create a `src/components/` directory and add the following components:
 
 {@inject: examples/trading/frontend/src/components/SuiObjectDisplay.tsx}
 
-### Set up routes
+### Set up routing
 
 The imported template only has a single page. To add more pages, you need to set up routing.
 
