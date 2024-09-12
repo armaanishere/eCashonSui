@@ -6,6 +6,8 @@ import path from "path";
 import math from "remark-math";
 import katex from "rehype-katex";
 
+const effortRemarkPlugin = require("./src/plugins/effort");
+
 require("dotenv").config();
 
 /** @type {import('@docusaurus/types').Config} */
@@ -49,10 +51,11 @@ const config = {
   },
   plugins: [
     // ....
+    // path.resolve(__dirname, `./src/plugins/examples`),
     [
       "posthog-docusaurus",
       {
-        apiKey: process.env.POSTHOG_API_KEY || 'dev', // required
+        apiKey: process.env.POSTHOG_API_KEY || "dev", // required
         appUrl: "https://us.i.posthog.com", // optional, defaults to "https://us.i.posthog.com"
         enableInDevelopment: false, // optional
       },
@@ -119,6 +122,7 @@ const config = {
               require("@docusaurus/remark-plugin-npm2yarn"),
               { sync: true, converters: ["yarn", "pnpm"] },
             ],
+            effortRemarkPlugin,
           ],
           rehypePlugins: [katex],
         },
