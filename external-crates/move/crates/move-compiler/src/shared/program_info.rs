@@ -1,11 +1,9 @@
 // Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, fmt::Display, sync::Arc};
 
-use move_ir_types::location::Loc;
-use move_symbol_pool::Symbol;
-
+use self::known_attributes::AttributePosition;
 use crate::{
     expansion::ast::{AbilitySet, Attributes, ModuleIdent, TargetKind, Visibility},
     naming::ast::{
@@ -15,9 +13,12 @@ use crate::{
     parser::ast::{ConstantName, DatatypeName, Field, FunctionName, VariantName},
     shared::unique_map::UniqueMap,
     shared::*,
+    sui_mode::info::SuiInfo,
     typing::ast::{self as T},
     FullyCompiledProgram,
 };
+use move_ir_types::location::Loc;
+use move_symbol_pool::Symbol;
 
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
@@ -50,18 +51,27 @@ pub struct ModuleInfo {
     pub constants: UniqueMap<ConstantName, ConstantInfo>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProgramInfo<const AFTER_TYPING: bool> {
+    pub modules: UniqueMap<ModuleIdent, ModuleInfo>,
+    pub sui_flavor_info: Option<SuiInfo>,
+}
+pub type NamingProgramInfo = ProgramInfo<false>;
+pub type TypingProgramInfo = ProgramInfo<true>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatatypeKind {
     Struct,
     Enum,
 }
 
-#[derive(Debug, Clone)]
-pub struct ProgramInfo<const AFTER_TYPING: bool> {
-    pub modules: UniqueMap<ModuleIdent, ModuleInfo>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedMemberKind {
+    Struct,
+    Enum,
+    Function,
+    Constant,
 }
-pub type NamingProgramInfo = ProgramInfo<false>;
-pub type TypingProgramInfo = ProgramInfo<true>;
 
 macro_rules! program_info {
     ($pre_compiled_lib:ident, $prog:ident, $pass:ident, $module_use_funs:ident) => {{
@@ -108,12 +118,16 @@ macro_rules! program_info {
                 }
             }
         }
-        ProgramInfo { modules }
+        ProgramInfo {
+            modules,
+            sui_flavor_info: None,
+        }
     }};
 }
 
 impl TypingProgramInfo {
     pub fn new(
+        env: &CompilationEnv,
         pre_compiled_lib: Option<Arc<FullyCompiledProgram>>,
         modules: &UniqueMap<ModuleIdent, T::ModuleDefinition>,
         mut module_use_funs: BTreeMap<ModuleIdent, ResolvedUseFuns>,
@@ -123,7 +137,18 @@ impl TypingProgramInfo {
         }
         let mut module_use_funs = Some(&mut module_use_funs);
         let prog = Prog { modules };
-        program_info!(pre_compiled_lib, prog, typing, module_use_funs)
+        let pcl = pre_compiled_lib.clone();
+        let mut info = program_info!(pcl, prog, typing, module_use_funs);
+        // TODO we should really have an idea of root package flavor here
+        // but this feels roughly equivalent
+        if env
+            .package_configs()
+            .any(|(_, config)| config.flavor == Flavor::Sui)
+        {
+            let sui_flavor_info = SuiInfo::new(pre_compiled_lib, modules, &info);
+            info.sui_flavor_info = Some(sui_flavor_info);
+        };
+        info
     }
 }
 
@@ -161,17 +186,80 @@ impl NamingProgramInfo {
 
 impl<const AFTER_TYPING: bool> ProgramInfo<AFTER_TYPING> {
     pub fn module(&self, m: &ModuleIdent) -> &ModuleInfo {
-        self.modules
-            .get(m)
+        self.module_opt(m)
             .expect("ICE should have failed in naming")
     }
 
-    pub fn struct_definition(&self, m: &ModuleIdent, n: &DatatypeName) -> &StructDefinition {
-        let minfo = self.module(m);
-        minfo
-            .structs
-            .get(n)
+    pub fn module_opt(&self, m: &ModuleIdent) -> Option<&ModuleInfo> {
+        self.modules.get(m)
+    }
+
+    pub fn named_member_kind(&self, m: ModuleIdent, n: Name) -> NamedMemberKind {
+        let minfo = self.module(&m);
+        if minfo.structs.contains_key(&DatatypeName(n)) {
+            NamedMemberKind::Struct
+        } else if minfo.enums.contains_key(&DatatypeName(n)) {
+            NamedMemberKind::Enum
+        } else if minfo.functions.contains_key(&FunctionName(n)) {
+            NamedMemberKind::Function
+        } else if minfo.constants.contains_key(&ConstantName(n)) {
+            NamedMemberKind::Constant
+        } else {
+            panic!("ICE should have failed in naming")
+        }
+    }
+
+    pub fn function_info(&self, m: &ModuleIdent, n: &FunctionName) -> &FunctionInfo {
+        self.function_info_opt(m, n)
             .expect("ICE should have failed in naming")
+    }
+
+    pub fn function_info_opt(&self, m: &ModuleIdent, n: &FunctionName) -> Option<&FunctionInfo> {
+        self.module_opt(m)?.functions.get(n)
+    }
+
+    pub fn constant_info(&self, m: &ModuleIdent, n: &ConstantName) -> &ConstantInfo {
+        self.constant_info_opt(m, n)
+            .expect("ICE should have failed in naming")
+    }
+
+    pub fn constant_info_opt(&self, m: &ModuleIdent, n: &ConstantName) -> Option<&ConstantInfo> {
+        self.module_opt(m)?.constants.get(n)
+    }
+
+    pub fn datatype_kind(&self, m: &ModuleIdent, n: &DatatypeName) -> DatatypeKind {
+        match self.named_member_kind(*m, n.0) {
+            NamedMemberKind::Struct => DatatypeKind::Struct,
+            NamedMemberKind::Enum => DatatypeKind::Enum,
+            _ => panic!("ICE should have failed in naming"),
+        }
+    }
+
+    pub fn datatype_declared_loc(&self, m: &ModuleIdent, n: &DatatypeName) -> Loc {
+        match self.datatype_kind(m, n) {
+            DatatypeKind::Struct => self.struct_declared_loc_(m, &n.0.value),
+            DatatypeKind::Enum => self.enum_declared_loc_(m, &n.0.value),
+        }
+    }
+
+    pub fn datatype_declared_abilities(&self, m: &ModuleIdent, n: &DatatypeName) -> &AbilitySet {
+        match self.datatype_kind(m, n) {
+            DatatypeKind::Struct => self.struct_declared_abilities(m, n),
+            DatatypeKind::Enum => self.enum_declared_abilities(m, n),
+        }
+    }
+
+    pub fn struct_definition(&self, m: &ModuleIdent, n: &DatatypeName) -> &StructDefinition {
+        self.struct_definition_opt(m, n)
+            .expect("ICE should have failed in naming")
+    }
+
+    pub fn struct_definition_opt(
+        &self,
+        m: &ModuleIdent,
+        n: &DatatypeName,
+    ) -> Option<&StructDefinition> {
+        self.module_opt(m)?.structs.get(n)
     }
 
     pub fn struct_declared_abilities(&self, m: &ModuleIdent, n: &DatatypeName) -> &AbilitySet {
@@ -196,61 +284,6 @@ impl<const AFTER_TYPING: bool> ProgramInfo<AFTER_TYPING> {
         n: &DatatypeName,
     ) -> &Vec<DatatypeTypeParameter> {
         &self.struct_definition(m, n).type_parameters
-    }
-
-    pub fn enum_definition(&self, m: &ModuleIdent, n: &DatatypeName) -> &EnumDefinition {
-        let minfo = self.module(m);
-        minfo
-            .enums
-            .get(n)
-            .expect("ICE should have failed in naming")
-    }
-
-    pub fn enum_declared_abilities(&self, m: &ModuleIdent, n: &DatatypeName) -> &AbilitySet {
-        &self.enum_definition(m, n).abilities
-    }
-
-    pub fn enum_declared_loc(&self, m: &ModuleIdent, n: &DatatypeName) -> Loc {
-        self.enum_declared_loc_(m, &n.0.value)
-    }
-
-    pub fn enum_declared_loc_(&self, m: &ModuleIdent, n: &Symbol) -> Loc {
-        let minfo = self.module(m);
-        *minfo
-            .enums
-            .get_loc_(n)
-            .expect("ICE should have failed in naming")
-    }
-
-    pub fn enum_type_parameters(
-        &self,
-        m: &ModuleIdent,
-        n: &DatatypeName,
-    ) -> &Vec<DatatypeTypeParameter> {
-        &self.enum_definition(m, n).type_parameters
-    }
-
-    pub fn datatype_kind(&self, m: &ModuleIdent, n: &DatatypeName) -> DatatypeKind {
-        match (
-            self.module(m).structs.contains_key(n),
-            self.module(m).enums.contains_key(n),
-        ) {
-            (true, false) => DatatypeKind::Struct,
-            (false, true) => DatatypeKind::Enum,
-            (false, false) | (true, true) => panic!("ICE should have failed in naming"),
-        }
-    }
-
-    pub fn function_info(&self, m: &ModuleIdent, n: &FunctionName) -> &FunctionInfo {
-        self.module(m)
-            .functions
-            .get(n)
-            .expect("ICE should have failed in naming")
-    }
-
-    pub fn constant_info(&mut self, m: &ModuleIdent, n: &ConstantName) -> &ConstantInfo {
-        let constants = &self.module(m).constants;
-        constants.get(n).expect("ICE should have failed in naming")
     }
 
     pub fn is_struct(&self, module: &ModuleIdent, datatype_name: &DatatypeName) -> bool {
@@ -278,6 +311,43 @@ impl<const AFTER_TYPING: bool> ProgramInfo<AFTER_TYPING> {
             N::StructFields::Defined(is_positional, _) => is_positional,
             N::StructFields::Native(_) => false,
         }
+    }
+
+    pub fn enum_definition(&self, m: &ModuleIdent, n: &DatatypeName) -> &EnumDefinition {
+        self.enum_definition_opt(m, n)
+            .expect("ICE should have failed in naming")
+    }
+
+    pub fn enum_definition_opt(
+        &self,
+        m: &ModuleIdent,
+        n: &DatatypeName,
+    ) -> Option<&EnumDefinition> {
+        self.module_opt(m)?.enums.get(n)
+    }
+
+    pub fn enum_declared_abilities(&self, m: &ModuleIdent, n: &DatatypeName) -> &AbilitySet {
+        &self.enum_definition(m, n).abilities
+    }
+
+    pub fn enum_declared_loc(&self, m: &ModuleIdent, n: &DatatypeName) -> Loc {
+        self.enum_declared_loc_(m, &n.0.value)
+    }
+
+    pub fn enum_declared_loc_(&self, m: &ModuleIdent, n: &Symbol) -> Loc {
+        let minfo = self.module(m);
+        *minfo
+            .enums
+            .get_loc_(n)
+            .expect("ICE should have failed in naming")
+    }
+
+    pub fn enum_type_parameters(
+        &self,
+        m: &ModuleIdent,
+        n: &DatatypeName,
+    ) -> &Vec<DatatypeTypeParameter> {
+        &self.enum_definition(m, n).type_parameters
     }
 
     /// Returns the enum variant names in sorted order.
@@ -349,6 +419,37 @@ impl<const AFTER_TYPING: bool> ProgramInfo<AFTER_TYPING> {
         match &vdef.fields {
             N::VariantFields::Empty => false,
             N::VariantFields::Defined(is_positional, _m) => *is_positional,
+        }
+    }
+}
+
+impl Display for NamedMemberKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NamedMemberKind::Struct => write!(f, "struct"),
+            NamedMemberKind::Enum => write!(f, "enum"),
+            NamedMemberKind::Function => write!(f, "function"),
+            NamedMemberKind::Constant => write!(f, "constant"),
+        }
+    }
+}
+
+impl From<NamedMemberKind> for AttributePosition {
+    fn from(nmk: NamedMemberKind) -> Self {
+        match nmk {
+            NamedMemberKind::Struct => AttributePosition::Struct,
+            NamedMemberKind::Enum => AttributePosition::Enum,
+            NamedMemberKind::Function => AttributePosition::Function,
+            NamedMemberKind::Constant => AttributePosition::Constant,
+        }
+    }
+}
+
+impl From<DatatypeKind> for NamedMemberKind {
+    fn from(dt: DatatypeKind) -> Self {
+        match dt {
+            DatatypeKind::Struct => NamedMemberKind::Struct,
+            DatatypeKind::Enum => NamedMemberKind::Enum,
         }
     }
 }

@@ -141,6 +141,7 @@ const addCodeInject = function (source) {
                 for (let struct of structs) {
                   struct = struct.trim();
                   const structStr = `^(\\s*)*?(pub(lic)? )?struct \\b${struct}\\b.*?}`;
+                  const structStr = `^(\\s*)*?(pub(lic)? )?struct \\b${struct}\\b.*?}`;
                   const structRE = new RegExp(structStr, "msi");
                   const structMatch = structRE.exec(injectFileContent);
                   if (structMatch) {

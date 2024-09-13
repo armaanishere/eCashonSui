@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 /// should not need to specify any field, except db_path.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Parameters {
-    /// The database path.
-    /// Required.
-    pub db_path: Option<PathBuf>,
+    /// Path to consensus DB for this epoch. Required when initializing consensus.
+    /// This is calculated based on user configuration for base directory.
+    #[serde(skip)]
+    pub db_path: PathBuf,
 
     /// Time to wait for parent round leader before sealing a block.
     #[serde(default = "Parameters::default_leader_timeout")]
@@ -56,8 +57,8 @@ pub struct Parameters {
     #[serde(default = "Parameters::default_commit_sync_batch_size")]
     pub commit_sync_batch_size: u32,
 
-    // Maximum number of commit batches being fetched, before throttling
-    // of outgoing commit fetches starts.
+    // This affects the maximum number of commit batches being fetched, and those fetched but not
+    // processed as consensus output, before throttling of outgoing commit fetches starts.
     #[serde(default = "Parameters::default_commit_sync_batches_ahead")]
     pub commit_sync_batches_ahead: usize,
 
@@ -68,6 +69,12 @@ pub struct Parameters {
     /// Tonic network settings.
     #[serde(default = "TonicParameters::default")]
     pub tonic: TonicParameters,
+
+    /// Time to wait during node start up until the node has synced the last proposed block via the
+    /// network peers. When set to `0` the sync mechanism is disabled. This property is meant to be
+    /// used for amnesia recovery.
+    #[serde(default = "Parameters::default_sync_last_known_own_block_timeout")]
+    pub sync_last_known_own_block_timeout: Duration,
 }
 
 impl Parameters {
@@ -122,19 +129,33 @@ impl Parameters {
     }
 
     pub(crate) fn default_commit_sync_batches_ahead() -> usize {
-        200
+        // This is set to be a multiple of default commit_sync_parallel_fetches to allow fetching ahead,
+        // while keeping the total number of inflight fetches and unprocessed fetched commits limited.
+        80
+    }
+
+    pub(crate) fn default_sync_last_known_own_block_timeout() -> Duration {
+        if cfg!(msim) {
+            Duration::from_millis(500)
+        } else {
+            // Here we prioritise liveness over the complete de-risking of block equivocation. 5 seconds
+            // in the majority of cases should be good enough for this given a healthy network.
+            Duration::from_secs(5)
+        }
     }
 }
 
 impl Default for Parameters {
     fn default() -> Self {
         Self {
-            db_path: None,
+            db_path: PathBuf::default(),
             leader_timeout: Parameters::default_leader_timeout(),
             min_round_delay: Parameters::default_min_round_delay(),
             max_forward_time_drift: Parameters::default_max_forward_time_drift(),
             dag_state_cached_rounds: Parameters::default_dag_state_cached_rounds(),
             max_blocks_per_fetch: Parameters::default_max_blocks_per_fetch(),
+            sync_last_known_own_block_timeout:
+                Parameters::default_sync_last_known_own_block_timeout(),
             commit_sync_parallel_fetches: Parameters::default_commit_sync_parallel_fetches(),
             commit_sync_batch_size: Parameters::default_commit_sync_batch_size(),
             commit_sync_batches_ahead: Parameters::default_commit_sync_batches_ahead(),

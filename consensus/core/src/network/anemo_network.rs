@@ -22,7 +22,6 @@ use anemo_tower::{
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
-use cfg_if::cfg_if;
 use consensus_config::{AuthorityIndex, NetworkKeyPair};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
@@ -210,6 +209,30 @@ impl NetworkClient for AnemoClient {
         let response = response.into_body();
         Ok((response.commits, response.certifier_blocks))
     }
+
+    async fn fetch_latest_blocks(
+        &self,
+        peer: AuthorityIndex,
+        authorities: Vec<AuthorityIndex>,
+        timeout: Duration,
+    ) -> ConsensusResult<Vec<Bytes>> {
+        let mut client = self.get_client(peer, timeout).await?;
+        let request = FetchLatestBlocksRequest { authorities };
+        let response = client
+            .fetch_latest_blocks(anemo::Request::new(request).with_timeout(timeout))
+            .await
+            .map_err(|e: Status| {
+                if e.status() == StatusCode::RequestTimeout {
+                    ConsensusError::NetworkRequestTimeout(format!(
+                        "fetch_latest_blocks timeout: {e:?}"
+                    ))
+                } else {
+                    ConsensusError::NetworkRequest(format!("fetch_latest_blocks failed: {e:?}"))
+                }
+            })?;
+        let body = response.into_body();
+        Ok(body.blocks)
+    }
 }
 
 /// Proxies Anemo requests to NetworkService with actual handler implementation.
@@ -347,6 +370,36 @@ impl<S: NetworkService> ConsensusRpc for AnemoServiceProxy<S> {
             certifier_blocks,
         }))
     }
+
+    async fn fetch_latest_blocks(
+        &self,
+        request: anemo::Request<FetchLatestBlocksRequest>,
+    ) -> Result<anemo::Response<FetchLatestBlocksResponse>, anemo::rpc::Status> {
+        let Some(peer_id) = request.peer_id() else {
+            return Err(anemo::rpc::Status::new_with_message(
+                anemo::types::response::StatusCode::BadRequest,
+                "peer_id not found",
+            ));
+        };
+        let index = self.peer_map.get(peer_id).ok_or_else(|| {
+            anemo::rpc::Status::new_with_message(
+                anemo::types::response::StatusCode::BadRequest,
+                "peer not found",
+            )
+        })?;
+        let body = request.into_body();
+        let blocks = self
+            .service
+            .handle_fetch_latest_blocks(*index, body.authorities)
+            .await
+            .map_err(|e| {
+                anemo::rpc::Status::new_with_message(
+                    anemo::types::response::StatusCode::BadRequest,
+                    format!("{e}"),
+                )
+            })?;
+        Ok(Response::new(FetchLatestBlocksResponse { blocks }))
+    }
 }
 
 /// Manages the lifecycle of Anemo network. Typical usage during initialization:
@@ -394,18 +447,17 @@ impl<S: NetworkService> NetworkManager<S> for AnemoManager {
             .with_label_values(&["anemo"])
             .set(1);
 
+        debug!("Starting anemo service");
+
         let server = ConsensusRpcServer::new(AnemoServiceProxy::new(self.context.clone(), service));
         let authority = self.context.committee.authority(self.context.own_index);
-        // Bind to localhost in unit tests since only local networking is needed.
-        // Bind to the unspecified address to allow the actual address to be assigned,
-        // in simtest and production.
-        cfg_if!(
-            if #[cfg(test)] {
-                let own_address = authority.address.with_localhost_ip();
-            } else {
-                let own_address = authority.address.with_zero_ip();
-            }
-        );
+        // By default, bind to the unspecified address to allow the actual address to be assigned.
+        // But bind to localhost if it is requested.
+        let own_address = if authority.address.is_localhost_ip() {
+            authority.address.clone()
+        } else {
+            authority.address.with_zero_ip()
+        };
         let epoch_string: String = self.context.committee.epoch().to_string();
         let inbound_network_metrics = self.context.metrics.network_metrics.inbound.clone();
         let outbound_network_metrics = self.context.metrics.network_metrics.outbound.clone();
@@ -661,4 +713,15 @@ pub(crate) struct FetchCommitsResponse {
     commits: Vec<Bytes>,
     // Serialized SignedBlock that certify the last commit from above.
     certifier_blocks: Vec<Bytes>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FetchLatestBlocksRequest {
+    authorities: Vec<AuthorityIndex>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FetchLatestBlocksResponse {
+    // Serialized SignedBlocks.
+    blocks: Vec<Bytes>,
 }

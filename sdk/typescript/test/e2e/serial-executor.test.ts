@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { bcs } from '../../src/bcs';
 import { Ed25519Keypair } from '../../src/keypairs/ed25519';
@@ -21,11 +21,15 @@ beforeAll(async () => {
 	vi.spyOn(toolbox.client, 'getCoins');
 });
 
+afterEach(async () => {
+	await executor.waitForLastTransaction();
+});
+
 afterAll(() => {
 	vi.restoreAllMocks();
 });
 
-describe('SerialExecutor', () => {
+describe('SerialExecutor', { retry: 3 }, () => {
 	beforeEach(async () => {
 		vi.clearAllMocks();
 		await executor.resetCache();

@@ -391,7 +391,7 @@ async function normalizeInputs(
 						UnresolvedObject: {
 							objectId: inputValue,
 						},
-				  }
+					}
 				: input;
 
 			inputs[arg.Input] = unresolvedObject;
@@ -435,6 +435,10 @@ function isUsedAsMutable(transactionData: TransactionDataBuilder, index: number)
 		if (tx.MoveCall && tx.MoveCall._argumentTypes) {
 			const argIndex = tx.MoveCall.arguments.indexOf(arg);
 			usedAsMutable = tx.MoveCall._argumentTypes[argIndex].ref !== '&' || usedAsMutable;
+		}
+
+		if (tx.$kind === 'MakeMoveVec' || tx.$kind === 'MergeCoins' || tx.$kind === 'SplitCoins') {
+			usedAsMutable = true;
 		}
 	});
 

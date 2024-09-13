@@ -39,10 +39,10 @@ use typed_store::rocks::{
 };
 use typed_store::traits::Map;
 use typed_store::traits::{TableSummary, TypedStoreDebug};
-use typed_store_derive::DBMapUtils;
+use typed_store::DBMapUtils;
 
 type OwnerIndexKey = (SuiAddress, ObjectID);
-type CoinIndexKey = (SuiAddress, String, ObjectID);
+pub type CoinIndexKey = (SuiAddress, String, ObjectID);
 type DynamicFieldKey = (ObjectID, ObjectID);
 type EventId = (TxSequenceNumber, usize);
 type EventIndex = (TransactionEventsDigest, TransactionDigest, u64);
@@ -129,7 +129,7 @@ impl IndexStoreMetrics {
 pub struct IndexStoreCaches {
     per_coin_type_balance: ShardedLruCache<(SuiAddress, TypeTag), SuiResult<TotalBalance>>,
     all_balances: ShardedLruCache<SuiAddress, SuiResult<Arc<HashMap<TypeTag, TotalBalance>>>>,
-    locks: MutexTable<SuiAddress>,
+    pub locks: MutexTable<SuiAddress>,
 }
 
 #[derive(Default)]
@@ -229,7 +229,7 @@ impl IndexStoreTables {
 pub struct IndexStore {
     next_sequence_number: AtomicU64,
     tables: IndexStoreTables,
-    caches: IndexStoreCaches,
+    pub caches: IndexStoreCaches,
     metrics: Arc<IndexStoreMetrics>,
     max_type_length: u64,
     remove_deprecated_tables: bool,
@@ -237,31 +237,33 @@ pub struct IndexStore {
 
 // These functions are used to initialize the DB tables
 fn transactions_order_table_default_config() -> DBOptions {
-    default_db_options()
+    default_db_options().disable_write_throttling()
 }
 fn transactions_seq_table_default_config() -> DBOptions {
-    default_db_options()
+    default_db_options().disable_write_throttling()
 }
 fn transactions_from_addr_table_default_config() -> DBOptions {
-    default_db_options()
+    default_db_options().disable_write_throttling()
 }
 fn transactions_to_addr_table_default_config() -> DBOptions {
-    default_db_options()
+    default_db_options().disable_write_throttling()
 }
 fn transactions_by_move_function_table_default_config() -> DBOptions {
-    default_db_options()
+    default_db_options().disable_write_throttling()
 }
 fn timestamps_table_default_config() -> DBOptions {
-    default_db_options().optimize_for_point_lookup(64)
+    default_db_options()
+        .optimize_for_point_lookup(64)
+        .disable_write_throttling()
 }
 fn owner_index_table_default_config() -> DBOptions {
-    default_db_options()
+    default_db_options().disable_write_throttling()
 }
 fn dynamic_field_index_table_default_config() -> DBOptions {
-    default_db_options()
+    default_db_options().disable_write_throttling()
 }
 fn index_table_default_config() -> DBOptions {
-    default_db_options()
+    default_db_options().disable_write_throttling()
 }
 fn coin_index_table_default_config() -> DBOptions {
     default_db_options()
@@ -269,6 +271,7 @@ fn coin_index_table_default_config() -> DBOptions {
         .optimize_for_read(
             read_size_from_env(ENV_VAR_COIN_INDEX_BLOCK_CACHE_SIZE_MB).unwrap_or(5 * 1024),
         )
+        .disable_write_throttling()
 }
 
 impl IndexStore {
@@ -348,19 +351,16 @@ impl IndexStore {
         let (input_coins, written_coins) = tx_coins.unwrap();
         // 1. Delete old owner if the object is deleted or transferred to a new owner,
         // by looking at `object_index_changes.deleted_owners`.
-        // Objects in `deleted_owners` must be owned by `Owner::Address` before the tx,
-        // hence must appear in the tx inputs.
-        // They also mut be coin type (see `AuthorityState::commit_certificate`).
+        // Objects in `deleted_owners` must be coin type (see `AuthorityState::commit_certificate`).
         let coin_delete_keys = object_index_changes
             .deleted_owners
             .iter()
             .filter_map(|(owner, obj_id)| {
-                // If it's not in `input_coins`, then it's not a coin type. Skip.
-                let object = input_coins.get(obj_id)?;
+                let object = input_coins.get(obj_id).or(written_coins.get(obj_id))?;
                 let coin_type_tag = object.coin_type_maybe().unwrap_or_else(|| {
                     panic!(
-                        "object_id: {:?} in input_coins is not a coin type, input_coins: {:?}, tx_digest: {:?}",
-                        obj_id, input_coins, digest
+                        "object_id: {:?} is not a coin type, input_coins: {:?}, written_coins: {:?}, tx_digest: {:?}",
+                        obj_id, input_coins, written_coins, digest
                     )
                 });
                 let map = balance_changes.entry(*owner).or_default();
@@ -1461,7 +1461,7 @@ impl IndexStore {
         metrics.all_balance_lookup_from_db.inc();
         let mut balances: HashMap<TypeTag, TotalBalance> = HashMap::new();
         let coins = Self::get_owned_coins_iterator(&coin_index, owner, None)?
-            .group_by(|(coin_type, _obj_id, _coin)| coin_type.clone());
+            .chunk_by(|(coin_type, _obj_id, _coin)| coin_type.clone());
         for (coin_type, coins) in &coins {
             let mut total_balance = 0i128;
             let mut coin_object_count = 0;

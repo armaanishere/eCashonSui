@@ -98,7 +98,7 @@ where
 
     /// Get the mutable bridge object arg on chain.
     // We retry a few times in case of errors. If it fails eventually, we panic.
-    // In generaly it's safe to call in the beginning of the program.
+    // In general it's safe to call in the beginning of the program.
     // After the first call, the result is cached since the value should never change.
     pub async fn get_mutable_bridge_object_arg_must_succeed(&self) -> ObjectArg {
         static ARG: OnceCell<ObjectArg> = OnceCell::const_new();
@@ -791,7 +791,7 @@ mod tests {
         let id_token_map = sui_client.get_token_id_map().await.unwrap();
 
         // 1. Create a Eth -> Sui Transfer (recipient is sender address), approve with validator secrets and assert its status to be Claimed
-        let action = get_test_eth_to_sui_bridge_action(None, Some(usdc_amount), Some(sender));
+        let action = get_test_eth_to_sui_bridge_action(None, Some(usdc_amount), Some(sender), None);
         let usdc_object_ref = approve_action_with_validator_secrets(
             context,
             bridge_object_arg,

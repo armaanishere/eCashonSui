@@ -125,7 +125,7 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
                 debug!(
                     "Delaying retry {} of peer {} subscription, in {} seconds",
                     retries,
-                    peer,
+                    peer_hostname,
                     delay.as_secs_f32(),
                 );
                 sleep(delay).await;
@@ -152,7 +152,7 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
                         .metrics
                         .node_metrics
                         .subscriber_connection_attempts
-                        .with_label_values(&[&peer_hostname, "success"])
+                        .with_label_values(&[peer_hostname, "success"])
                         .inc();
                     blocks
                 }
@@ -162,7 +162,7 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
                         .metrics
                         .node_metrics
                         .subscriber_connection_attempts
-                        .with_label_values(&[&peer_hostname, "failure"])
+                        .with_label_values(&[peer_hostname, "failure"])
                         .inc();
                     continue 'subscription;
                 }
@@ -184,7 +184,7 @@ impl<C: NetworkClient, S: NetworkService> Subscriber<C, S> {
                             .metrics
                             .node_metrics
                             .subscribed_blocks
-                            .with_label_values(&[&peer_hostname])
+                            .with_label_values(&[peer_hostname])
                             .inc();
                         let result = authority_service
                             .handle_send_block(peer, block.clone())
@@ -282,6 +282,15 @@ mod test {
             _commit_range: CommitRange,
             _timeout: Duration,
         ) -> ConsensusResult<(Vec<Bytes>, Vec<Bytes>)> {
+            unimplemented!("Unimplemented")
+        }
+
+        async fn fetch_latest_blocks(
+            &self,
+            _peer: AuthorityIndex,
+            _authorities: Vec<AuthorityIndex>,
+            _timeout: Duration,
+        ) -> ConsensusResult<Vec<Bytes>> {
             unimplemented!("Unimplemented")
         }
     }

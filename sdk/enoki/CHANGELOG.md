@@ -1,5 +1,104 @@
 # @mysten/enoki
 
+## 0.4.2
+
+### Patch Changes
+
+- Updated dependencies [2c96b06]
+- Updated dependencies [1fd22cc]
+  - @mysten/sui@1.9.0
+  - @mysten/zklogin@0.7.19
+
+## 0.4.1
+
+### Patch Changes
+
+- Updated dependencies [569511a]
+  - @mysten/sui@1.8.0
+  - @mysten/zklogin@0.7.18
+
+## 0.4.0
+
+### Minor Changes
+
+- f589885: Add sdk methods for managing enoki subnames
+
+## 0.3.17
+
+### Patch Changes
+
+- Updated dependencies [143cd9d]
+- Updated dependencies [4357ac6]
+- Updated dependencies [4019dd7]
+- Updated dependencies [4019dd7]
+- Updated dependencies [00a974d]
+  - @mysten/sui@1.7.0
+  - @mysten/zklogin@0.7.17
+
+## 0.3.16
+
+### Patch Changes
+
+- Updated dependencies [a3e32fe]
+  - @mysten/sui@1.6.0
+  - @mysten/zklogin@0.7.16
+
+## 0.3.15
+
+### Patch Changes
+
+- Updated dependencies [6f79ed9]
+  - @mysten/zklogin@0.7.15
+
+## 0.3.14
+
+### Patch Changes
+
+- Updated dependencies [0851b31]
+- Updated dependencies [f37b3c2]
+  - @mysten/sui@1.5.0
+  - @mysten/zklogin@0.7.14
+
+## 0.3.13
+
+### Patch Changes
+
+- Updated dependencies [4419234]
+  - @mysten/sui@1.4.0
+  - @mysten/zklogin@0.7.13
+
+## 0.3.12
+
+### Patch Changes
+
+- Updated dependencies [a45f461]
+  - @mysten/sui@1.3.1
+  - @mysten/zklogin@0.7.12
+
+## 0.3.11
+
+### Patch Changes
+
+- 0f27a97: Update dependencies
+- Updated dependencies [7fc464a]
+- Updated dependencies [086b2bc]
+- Updated dependencies [0fb0628]
+- Updated dependencies [cdedf69]
+- Updated dependencies [0f27a97]
+- Updated dependencies [beed646]
+  - @mysten/sui@1.3.0
+  - @mysten/zklogin@0.7.11
+
+## 0.3.10
+
+### Patch Changes
+
+- Updated dependencies [06a900c1ab]
+- Updated dependencies [45877014d1]
+- Updated dependencies [87d6f75403]
+  - @mysten/sui@1.2.1
+  - @mysten/zklogin@0.7.10
+
 ## 0.3.9
 
 ### Patch Changes
@@ -76,8 +175,10 @@
 
 ### Minor Changes
 
-- a92b03de42: The Typescript SDK has been renamed to `@mysten/sui` and includes many new features and breaking changes.
-  See the [full migration guide](https://sdk.mystenlabs.com/typescript/migrations/sui-1.0) for details on how to upgrade.
+- a92b03de42: The Typescript SDK has been renamed to `@mysten/sui` and includes many new features
+  and breaking changes. See the
+  [full migration guide](https://sdk.mystenlabs.com/typescript/migrations/sui-1.0) for details on
+  how to upgrade.
 
 ### Patch Changes
 

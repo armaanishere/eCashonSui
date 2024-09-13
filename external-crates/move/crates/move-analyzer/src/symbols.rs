@@ -5,10 +5,14 @@
 //! and typed ASTs, in particular identifier definitions to be used for implementing go-to-def,
 //! go-to-references, and on-hover language server commands.
 //!
-//! There are different structs that are used at different phases of the process, the
-//! ParsingSymbolicator and Typing Symbolicator structs are used when building symbolication
-//! information and the Symbols struct is summarizes the symbolication results and is used by the
-//! language server find definitions and references.
+//! The analysis starts with top-level module definitions being processed and then proceeds to
+//! process parsed AST (parsing analysis) and typed AST (typing analysis) to gather all the required
+//! information which is then summarized in the Symbols struct subsequently used by the language
+//! server to find definitions, references, auto-completions, etc.  Parsing analysis is largely
+//! responsible for processing import statements (no longer available at the level of typed AST) and
+//! typing analysis gathers remaining information. In particular, for local definitions, typing
+//! analysis builds a scope stack, entering encountered definitions and matching uses to a
+//! definition in the innermost scope.
 //!
 //! Here is a brief description of how the symbolication information is encoded. Each identifier in
 //! the source code of a given module is represented by its location (UseLoc struct): line number,
@@ -45,21 +49,14 @@
 //! We also associate all uses of an identifier with its definition to support
 //! go-to-references. This is done in a global map from an identifier location (DefLoc) to a set of
 //! use locations (UseLoc).
-//!
-//! Symbolication algorithm over typing AST first analyzes all top-level definitions from all
-//! modules. ParsingSymbolicator then processes import statements (no longer available at the level
-//! of typed AST) and TypingSymbolicator processes function bodies, as well as constant and struct
-//! definitions. For local definitions, TypingSymbolicator builds a scope stack, entering
-//! encountered definitions and matching uses to a definition in the innermost scope.
-
 #![allow(clippy::non_canonical_partial_ord_impl)]
 
 use crate::{
-    analysis::typing_analysis,
+    analysis::{parsing_analysis, typing_analysis},
     compiler_info::CompilerInfo,
     context::Context,
     diagnostics::{lsp_diagnostics, lsp_empty_diagnostics},
-    utils::loc_start_to_lsp_position_opt,
+    utils::{loc_start_to_lsp_position_opt, lsp_position_to_loc},
 };
 
 use anyhow::{anyhow, Result};
@@ -95,8 +92,8 @@ use move_compiler::{
     editions::{Edition, FeatureGate, Flavor},
     expansion::ast::{self as E, AbilitySet, ModuleIdent, ModuleIdent_, Value, Value_, Visibility},
     linters::LintLevel,
-    naming::ast::{StructFields, Type, TypeName_, Type_},
-    parser::ast::{self as P},
+    naming::ast::{DatatypeTypeParameter, StructFields, Type, TypeName_, Type_, VariantFields},
+    parser::ast as P,
     shared::{
         files::{FileId, MappedFiles},
         unique_map::UniqueMap,
@@ -148,6 +145,12 @@ pub enum FunType {
     Regular,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct VariantInfo {
+    pub name: Name,
+    pub empty: bool,
+    pub positional: bool,
+}
 /// Information about a definition of some identifier
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -166,7 +169,7 @@ pub enum DefInfo {
         /// Type args
         Vec<Type>,
         /// Arg names
-        Vec<Symbol>,
+        Vec<Name>,
         /// Arg types
         Vec<Type>,
         /// Ret type
@@ -186,7 +189,39 @@ pub enum DefInfo {
         /// Abilities
         AbilitySet,
         /// Field names
-        Vec<Symbol>,
+        Vec<Name>,
+        /// Field types
+        Vec<Type>,
+        /// Doc string
+        Option<String>,
+    ),
+    Enum(
+        /// Defining module
+        ModuleIdent_,
+        /// Name
+        Symbol,
+        /// Visibility
+        Visibility,
+        /// Type args
+        Vec<(Type, bool /* phantom */)>,
+        /// Abilities
+        AbilitySet,
+        /// Info about variants
+        Vec<VariantInfo>,
+        /// Doc string
+        Option<String>,
+    ),
+    Variant(
+        /// Defining module of the containing enum
+        ModuleIdent_,
+        /// Name of the containing enum
+        Symbol,
+        /// Variant name
+        Symbol,
+        /// Positional fields?
+        bool,
+        /// Field names
+        Vec<Name>,
         /// Field types
         Vec<Type>,
         /// Doc string
@@ -213,6 +248,9 @@ pub enum DefInfo {
         bool,
         /// Should displayed definition be preceded by `mut`?
         bool,
+        /// Location of enum's guard expression (if any) in case
+        /// this local definition represents match pattern's variable
+        Option<Loc>,
     ),
     Const(
         /// Defining module
@@ -256,26 +294,26 @@ pub struct FieldDef {
     pub loc: Loc,
 }
 
-/// Definition of a struct
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct StructDef {
-    pub name_loc: Loc,
-    pub field_defs: Vec<FieldDef>,
-    /// Does this struct have positional fields?
-    pub positional: bool,
+pub enum MemberDefInfo {
+    Struct {
+        field_defs: Vec<FieldDef>,
+        positional: bool,
+    },
+    Enum {
+        variants_info: BTreeMap<Symbol, (Loc, Vec<FieldDef>, /* positional */ bool)>,
+    },
+    Fun {
+        attrs: Vec<String>,
+    },
+    Const,
 }
 
-impl StructDef {
-    pub fn name_start(&self) -> Loc {
-        self.name_loc
-    }
-}
-
+/// Definition of a module member
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FunctionDef {
-    pub name: Symbol,
+pub struct MemberDef {
     pub name_loc: Loc,
-    pub attrs: Vec<String>,
+    pub info: MemberDefInfo,
 }
 
 /// Definition of a local (or parameter)
@@ -291,13 +329,50 @@ pub struct LocalDef {
     pub def_type: Type,
 }
 
-/// Definition of a constant
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ConstDef {
-    pub name_loc: Loc,
+/// Information about call sites relevant to the IDE
+#[derive(Debug, Clone, Ord, PartialOrd, PartialEq, Eq)]
+pub struct CallInfo {
+    /// Is it a dot call?
+    pub dot_call: bool,
+    /// Locations of arguments
+    pub arg_locs: Vec<Loc>,
+    /// Definition of function being called (as an Option as its computed after
+    /// this struct is created)
+    pub def_loc: Option<Loc>,
 }
 
-/// Module-level definitions
+impl CallInfo {
+    pub fn new(dot_call: bool, args: &[P::Exp]) -> Self {
+        Self {
+            dot_call,
+            arg_locs: args.iter().map(|e| e.loc).collect(),
+            def_loc: None,
+        }
+    }
+}
+
+/// Map from struct name to field order information
+pub type StructFieldOrderInfo = BTreeMap<Symbol, BTreeMap<Symbol, usize>>;
+/// Map from enum name to variant name to field order information
+pub type VariantFieldOrderInfo = BTreeMap<Symbol, BTreeMap<Symbol, BTreeMap<Symbol, usize>>>;
+
+/// Information about field order in structs and enums
+#[derive(Debug, Clone, Ord, PartialOrd, PartialEq, Eq)]
+pub struct FieldOrderInfo {
+    structs: BTreeMap<String, StructFieldOrderInfo>,
+    variants: BTreeMap<String, VariantFieldOrderInfo>,
+}
+
+impl FieldOrderInfo {
+    pub fn new() -> Self {
+        Self {
+            structs: BTreeMap::new(),
+            variants: BTreeMap::new(),
+        }
+    }
+}
+
+/// Module-level definitions and other module-related info
 #[derive(Debug, Clone, Ord, PartialOrd, PartialEq, Eq)]
 pub struct ModuleDefs {
     /// File where this module is located
@@ -307,39 +382,149 @@ pub struct ModuleDefs {
     /// Module name
     pub ident: ModuleIdent_,
     /// Struct definitions
-    pub structs: BTreeMap<Symbol, StructDef>,
+    pub structs: BTreeMap<Symbol, MemberDef>,
+    /// Enum definitions
+    pub enums: BTreeMap<Symbol, MemberDef>,
     /// Const definitions
-    pub constants: BTreeMap<Symbol, ConstDef>,
+    pub constants: BTreeMap<Symbol, MemberDef>,
     /// Function definitions
-    pub functions: BTreeMap<Symbol, FunctionDef>,
+    pub functions: BTreeMap<Symbol, MemberDef>,
     /// Definitions where the type is not explicitly specified
+    /// and should be inserted as an inlay hint
     pub untyped_defs: BTreeSet<Loc>,
+    /// Information about calls in this module
+    pub call_infos: BTreeMap<Loc, CallInfo>,
 }
 
-/// Data used during symbolication over parsed AST
-pub struct ParsingSymbolicator<'a> {
-    /// Outermost definitions in a module (structs, consts, functions), keyd on a ModuleIdent
-    /// string so that we can access it regardless of the ModuleIdent representation
-    /// (e.g., in the parsing AST or in the typing AST)
-    mod_outer_defs: &'a mut BTreeMap<String, ModuleDefs>,
-    /// Mapped file information for translating locations into positions
-    files: &'a MappedFiles,
-    /// Associates uses for a given definition to allow displaying all references
-    references: &'a mut References,
-    /// Additional information about definitions
-    def_info: &'a mut DefMap,
-    /// A UseDefMap for a given module (needs to be appropriately set before the module
-    /// processing starts)
-    use_defs: UseDefMap,
-    /// Current module identifier string (needs to be appropriately set before the module
-    /// processing starts)
-    current_mod_ident_str: Option<String>,
-    /// Module name lengths in access paths for a given module (needs to be appropriately
-    /// set before the module processing starts)
-    alias_lengths: BTreeMap<Position, usize>,
-    /// A per-package mapping from package names to their addresses (needs to be appropriately set
-    /// before the package processint starts)
-    pkg_addresses: &'a NamedAddressMap,
+#[derive(Clone, Debug)]
+pub struct CursorContext {
+    /// Set during typing analysis
+    pub module: Option<ModuleIdent>,
+    /// Set during typing analysis
+    pub defn_name: Option<CursorDefinition>,
+    // TODO: consider making this a vector to hold the whole chain upward
+    /// Set during parsing analysis
+    pub position: CursorPosition,
+    /// Location provided for the cursor
+    pub loc: Loc,
+}
+
+#[derive(Clone, Debug, Copy)]
+pub enum ChainCompletionKind {
+    Type,
+    Function,
+    All,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChainInfo {
+    pub chain: P::NameAccessChain,
+    pub kind: ChainCompletionKind,
+    pub inside_use: bool,
+}
+
+impl ChainInfo {
+    pub fn new(chain: P::NameAccessChain, kind: ChainCompletionKind, inside_use: bool) -> Self {
+        Self {
+            chain,
+            kind,
+            inside_use,
+        }
+    }
+}
+
+impl CursorContext {
+    fn new(loc: Loc) -> Self {
+        CursorContext {
+            module: None,
+            defn_name: None,
+            position: CursorPosition::Unknown,
+            loc,
+        }
+    }
+
+    /// Returns access chain at cursor position (if any) along with the information of what the chain's
+    /// auto-completed target kind should be, and weather it is part of the use statement.
+    pub fn find_access_chain(&self) -> Option<ChainInfo> {
+        use ChainCompletionKind as CT;
+        use CursorPosition as CP;
+        match &self.position {
+            CP::Exp(sp!(_, exp)) => match exp {
+                P::Exp_::Name(chain) if chain.loc.contains(&self.loc) => {
+                    return Some(ChainInfo::new(chain.clone(), CT::All, false))
+                }
+                P::Exp_::Call(chain, _) if chain.loc.contains(&self.loc) => {
+                    return Some(ChainInfo::new(chain.clone(), CT::Function, false))
+                }
+                P::Exp_::Pack(chain, _) if chain.loc.contains(&self.loc) => {
+                    return Some(ChainInfo::new(chain.clone(), CT::Type, false))
+                }
+                _ => (),
+            },
+            CP::Binding(sp!(_, bind)) => match bind {
+                P::Bind_::Unpack(chain, _) if chain.loc.contains(&self.loc) => {
+                    return Some(ChainInfo::new(*(chain.clone()), CT::Type, false))
+                }
+                _ => (),
+            },
+            CP::Type(sp!(_, ty)) => match ty {
+                P::Type_::Apply(chain) if chain.loc.contains(&self.loc) => {
+                    return Some(ChainInfo::new(*(chain.clone()), CT::Type, false))
+                }
+                _ => (),
+            },
+            CP::Attribute(attr_val) => match &attr_val.value {
+                P::AttributeValue_::ModuleAccess(chain) if chain.loc.contains(&self.loc) => {
+                    return Some(ChainInfo::new(chain.clone(), CT::All, false))
+                }
+                _ => (),
+            },
+            CP::Use(sp!(_, P::Use::Fun { function, ty, .. })) => {
+                if function.loc.contains(&self.loc) {
+                    return Some(ChainInfo::new(*(function.clone()), CT::Function, true));
+                }
+                if ty.loc.contains(&self.loc) {
+                    return Some(ChainInfo::new(*(ty.clone()), CT::Type, true));
+                }
+            }
+            _ => (),
+        };
+        None
+    }
+
+    /// Returns use declaration at cursor position (if any).
+    pub fn find_use_decl(&self) -> Option<P::Use> {
+        if let CursorPosition::Use(use_) = &self.position {
+            return Some(use_.value.clone());
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum CursorPosition {
+    Exp(P::Exp),
+    SeqItem(P::SequenceItem),
+    Binding(P::Bind),
+    Type(P::Type),
+    FieldDefn(P::Field),
+    Parameter(P::Var),
+    DefName,
+    Attribute(P::AttributeValue),
+    Use(Spanned<P::Use>),
+    Unknown,
+    // FIXME: These two are currently unused because these forms don't have enough location
+    // recorded on them during parsing.
+    DatatypeTypeParameter(P::DatatypeTypeParameter),
+    FunctionTypeParameter((Name, Vec<P::Ability>)),
+}
+
+#[derive(Clone, Debug)]
+pub enum CursorDefinition {
+    Function(P::FunctionName),
+    Constant(P::ConstantName),
+    Struct(P::DatatypeName),
+    Enum(P::DatatypeName),
 }
 
 type LineOffset = u32;
@@ -368,6 +553,8 @@ pub struct Symbols {
     pub def_info: DefMap,
     /// IDE Annotation Information from the Compiler
     pub compiler_info: CompilerInfo,
+    /// Cursor information gathered up during analysis
+    pub cursor_context: Option<CursorContext>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -383,11 +570,11 @@ pub struct SymbolicatorRunner {
 }
 
 impl ModuleDefs {
-    pub fn functions(&self) -> &BTreeMap<Symbol, FunctionDef> {
+    pub fn functions(&self) -> &BTreeMap<Symbol, MemberDef> {
         &self.functions
     }
 
-    pub fn structs(&self) -> &BTreeMap<Symbol, StructDef> {
+    pub fn structs(&self) -> &BTreeMap<Symbol, MemberDef> {
         &self.structs
     }
 
@@ -456,21 +643,8 @@ impl fmt::Display for DefInfo {
                 _,
             ) => {
                 let type_args_str =
-                    struct_type_args_to_ide_string(type_args, /* verbose */ true);
-                let abilities_str = if abilities.is_empty() {
-                    "".to_string()
-                } else {
-                    format!(
-                        " has {}",
-                        abilities
-                            .iter()
-                            .map(|a| format!("{a}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                };
-                // the mod_ident conversions below will ensure that only pkg name (without numerical
-                // address) is displayed which is the same as in source
+                    datatype_type_args_to_ide_string(type_args, /* verbose */ true);
+                let abilities_str = abilities_to_ide_string(abilities);
                 if field_names.is_empty() {
                     write!(
                         f,
@@ -499,17 +673,78 @@ impl fmt::Display for DefInfo {
                     )
                 }
             }
+            Self::Enum(mod_ident, name, visibility, type_args, abilities, variants, _) => {
+                let type_args_str =
+                    datatype_type_args_to_ide_string(type_args, /* verbose */ true);
+                let abilities_str = abilities_to_ide_string(abilities);
+                if variants.is_empty() {
+                    write!(
+                        f,
+                        "{}enum {}::{}{}{} {{}}",
+                        visibility_to_ide_string(visibility),
+                        mod_ident_to_ide_string(mod_ident),
+                        name,
+                        type_args_str,
+                        abilities_str,
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{}enum {}::{}{}{} {{\n{}\n}}",
+                        visibility_to_ide_string(visibility),
+                        mod_ident_to_ide_string(mod_ident),
+                        name,
+                        type_args_str,
+                        abilities_str,
+                        variant_to_ide_string(variants)
+                    )
+                }
+            }
+            Self::Variant(mod_ident, enum_name, name, positional, field_names, field_types, _) => {
+                if field_types.is_empty() {
+                    write!(
+                        f,
+                        "{}::{}::{}",
+                        mod_ident_to_ide_string(mod_ident),
+                        enum_name,
+                        name
+                    )
+                } else if *positional {
+                    write!(
+                        f,
+                        "{}::{}::{}({})",
+                        mod_ident_to_ide_string(mod_ident),
+                        enum_name,
+                        name,
+                        type_list_to_ide_string(field_types, /* verbose */ true)
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{}::{}::{}{{{}}}",
+                        mod_ident_to_ide_string(mod_ident),
+                        enum_name,
+                        name,
+                        typed_id_list_to_ide_string(
+                            field_names,
+                            field_types,
+                            /* separate_lines */ false,
+                            /* verbose */ true,
+                        ),
+                    )
+                }
+            }
             Self::Field(mod_ident, struct_name, name, t, _) => {
                 write!(
                     f,
                     "{}::{}\n{}: {}",
-                    mod_ident,
+                    mod_ident_to_ide_string(mod_ident),
                     struct_name,
                     name,
                     type_to_ide_string(t, /* verbose */ true)
                 )
             }
-            Self::Local(name, t, is_decl, is_mut) => {
+            Self::Local(name, t, is_decl, is_mut, _) => {
                 let mut_str = if *is_mut { "mut " } else { "" };
                 if *is_decl {
                     write!(
@@ -554,6 +789,83 @@ impl fmt::Display for DefInfo {
     }
 }
 
+impl fmt::Display for CursorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let CursorContext {
+            module,
+            defn_name,
+            position,
+            loc: _,
+        } = self;
+        writeln!(f, "cursor info:")?;
+        write!(f, "- module: ")?;
+        match module {
+            Some(mident) => writeln!(f, "{mident}"),
+            None => writeln!(f, "None"),
+        }?;
+        write!(f, "- definition: ")?;
+        match defn_name {
+            Some(defn) => match defn {
+                CursorDefinition::Function(name) => writeln!(f, "function {name}"),
+                CursorDefinition::Constant(name) => writeln!(f, "constant {name}"),
+                CursorDefinition::Struct(name) => writeln!(f, "struct {name}"),
+                CursorDefinition::Enum(name) => writeln!(f, "enum {name}"),
+            },
+            None => writeln!(f, "None"),
+        }?;
+        write!(f, "- position: ")?;
+        match position {
+            CursorPosition::Attribute(value) => {
+                writeln!(f, "attribute value")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::Use(value) => {
+                writeln!(f, "use value")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::DefName => {
+                writeln!(f, "defn name")?;
+            }
+            CursorPosition::Unknown => {
+                writeln!(f, "unknown")?;
+            }
+            CursorPosition::Exp(value) => {
+                writeln!(f, "exp")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::SeqItem(value) => {
+                writeln!(f, "seq item")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::Binding(value) => {
+                writeln!(f, "binder")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::Type(value) => {
+                writeln!(f, "type")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::FieldDefn(value) => {
+                writeln!(f, "field")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::Parameter(value) => {
+                writeln!(f, "parameter")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::DatatypeTypeParameter(value) => {
+                writeln!(f, "datatype type param")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+            CursorPosition::FunctionTypeParameter(value) => {
+                writeln!(f, "fun type param")?;
+                writeln!(f, "- value: {:#?}", value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn visibility_to_ide_string(visibility: &Visibility) -> String {
     let mut visibility_str = "".to_string();
 
@@ -573,18 +885,18 @@ pub fn type_args_to_ide_string(type_args: &[Type], verbose: bool) -> String {
     type_args_str
 }
 
-fn struct_type_args_to_ide_string(type_args: &[(Type, bool)], verbose: bool) -> String {
+fn datatype_type_args_to_ide_string(type_args: &[(Type, bool)], verbose: bool) -> String {
     let mut type_args_str = "".to_string();
     if !type_args.is_empty() {
         type_args_str.push('<');
-        type_args_str.push_str(&struct_type_list_to_ide_string(type_args, verbose));
+        type_args_str.push_str(&datatype_type_list_to_ide_string(type_args, verbose));
         type_args_str.push('>');
     }
     type_args_str
 }
 
 fn typed_id_list_to_ide_string(
-    names: &[Symbol],
+    names: &[Name],
     types: &[Type],
     separate_lines: bool,
     verbose: bool,
@@ -594,9 +906,9 @@ fn typed_id_list_to_ide_string(
         .zip(types.iter())
         .map(|(n, t)| {
             if separate_lines {
-                format!("\t{}: {}", n, type_to_ide_string(t, verbose))
+                format!("\t{}: {}", n.value, type_to_ide_string(t, verbose))
             } else {
-                format!("{}: {}", n, type_to_ide_string(t, verbose))
+                format!("{}: {}", n.value, type_to_ide_string(t, verbose))
             }
         })
         .collect::<Vec<_>>()
@@ -659,7 +971,7 @@ pub fn type_list_to_ide_string(types: &[Type], verbose: bool) -> String {
         .join(", ")
 }
 
-fn struct_type_list_to_ide_string(types: &[(Type, bool)], verbose: bool) -> String {
+fn datatype_type_list_to_ide_string(types: &[(Type, bool)], verbose: bool) -> String {
     types
         .iter()
         .map(|(t, phantom)| {
@@ -795,6 +1107,44 @@ fn fun_type_to_ide_string(fun_type: &FunType) -> String {
     .to_string()
 }
 
+fn abilities_to_ide_string(abilities: &AbilitySet) -> String {
+    if abilities.is_empty() {
+        "".to_string()
+    } else {
+        format!(
+            " has {}",
+            abilities
+                .iter()
+                .map(|a| format!("{a}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn variant_to_ide_string(variants: &[VariantInfo]) -> String {
+    // how many variant lines (including optional ellipsis if there
+    // are too many of them) are printed
+    const NUM_PRINTED: usize = 7;
+    let mut vstrings = variants
+        .iter()
+        .enumerate()
+        .map(|(idx, info)| {
+            if idx >= NUM_PRINTED - 1 {
+                "\t/* ... */".to_string()
+            } else if info.empty {
+                format!("\t{}", info.name)
+            } else if info.positional {
+                format!("\t{}( /* ... */ )", info.name)
+            } else {
+                format!("\t{}{{ /* ... */ }}", info.name)
+            }
+        })
+        .collect::<Vec<_>>();
+    vstrings.truncate(NUM_PRINTED);
+    vstrings.join(",\n")
+}
+
 impl SymbolicatorRunner {
     /// Create a new idle runner (one that does not actually symbolicate)
     pub fn idle() -> Self {
@@ -805,7 +1155,7 @@ impl SymbolicatorRunner {
     /// Create a new runner
     pub fn new(
         ide_files_root: VfsPath,
-        symbols: Arc<Mutex<Symbols>>,
+        symbols_map: Arc<Mutex<BTreeMap<PathBuf, Symbols>>>,
         pkg_deps: Arc<Mutex<BTreeMap<PathBuf, PrecompiledPkgDeps>>>,
         sender: Sender<Result<BTreeMap<PathBuf, Vec<Diagnostic>>>>,
         lint: LintLevel,
@@ -865,25 +1215,25 @@ impl SymbolicatorRunner {
                             continue;
                         }
                         eprintln!("symbolication started");
+                        let pkg_path = root_dir.unwrap();
                         match get_symbols(
                             pkg_deps.clone(),
                             ide_files_root.clone(),
-                            root_dir.unwrap().as_path(),
+                            pkg_path.as_path(),
                             lint,
+                            None,
                         ) {
                             Ok((symbols_opt, lsp_diagnostics)) => {
                                 eprintln!("symbolication finished");
                                 if let Some(new_symbols) = symbols_opt {
-                                    // merge the new symbols with the old ones to support a
-                                    // (potentially) new project/package that symbolication information
-                                    // was built for
+                                    // replace symbolication info for a given package
                                     //
                                     // TODO: we may consider "unloading" symbolication information when
                                     // files/directories are being closed but as with other performance
                                     // optimizations (e.g. incrementalizatino of the vfs), let's wait
                                     // until we know we actually need it
-                                    let mut old_symbols = symbols.lock().unwrap();
-                                    (*old_symbols).merge(new_symbols);
+                                    let mut old_symbols_map = symbols_map.lock().unwrap();
+                                    old_symbols_map.insert(pkg_path, new_symbols);
                                 }
                                 // set/reset (previous) diagnostics
                                 if let Err(err) = sender.send(Ok(lsp_diagnostics)) {
@@ -1001,7 +1351,7 @@ impl UseDef {
     }
 
     /// Given a UseDef, modify just the use name and location (to make it represent an alias).
-    fn rename_use(
+    pub fn rename_use(
         &mut self,
         references: &mut References,
         new_name: Symbol,
@@ -1158,15 +1508,6 @@ impl UseDefMap {
 }
 
 impl Symbols {
-    pub fn merge(&mut self, other: Self) {
-        for (k, v) in other.references {
-            self.references.entry(k).or_default().extend(v);
-        }
-        self.file_use_defs.extend(other.file_use_defs);
-        self.files.extend_with_duplicates(other.files);
-        self.def_info.extend(other.def_info);
-    }
-
     pub fn line_uses(&self, use_fpath: &Path, use_line: u32) -> BTreeSet<UseDef> {
         let Some(file_symbols) = self.file_use_defs.get(use_fpath) else {
             return BTreeSet::new();
@@ -1213,6 +1554,7 @@ pub fn get_symbols(
     ide_files_root: VfsPath,
     pkg_path: &Path,
     lint: LintLevel,
+    cursor_info: Option<(&PathBuf, Position)>,
 ) -> Result<(Option<Symbols>, BTreeMap<PathBuf, Vec<Diagnostic>>)> {
     let build_config = move_package::BuildConfig {
         test_mode: true,
@@ -1227,7 +1569,8 @@ pub fn get_symbols(
 
     // resolution graph diagnostics are only needed for CLI commands so ignore them by passing a
     // vector as the writer
-    let resolution_graph = build_config.resolution_graph_for_package(pkg_path, &mut Vec::new())?;
+    let resolution_graph =
+        build_config.resolution_graph_for_package(pkg_path, None, &mut Vec::new())?;
     let root_pkg_name = resolution_graph.graph.root_package_name;
 
     let overlay_fs_root = VfsPath::new(OverlayFS::new(&[
@@ -1409,7 +1752,7 @@ pub fn get_symbols(
     // uwrap's are safe - this function returns earlier (during diagnostics processing)
     // when failing to produce the ASTs
     let parsed_program = parsed_ast.unwrap();
-    let mut typed_modules = typed_ast.unwrap().modules;
+    let mut typed_program = typed_ast.clone().unwrap();
 
     let mut mod_outer_defs = BTreeMap::new();
     let mut mod_use_defs = BTreeMap::new();
@@ -1427,8 +1770,15 @@ pub fn get_symbols(
         file_id_to_lines.insert(*file_id, lines);
     }
 
+    let mut fields_order_info = FieldOrderInfo::new();
+
+    pre_process_parsed_program(&parsed_program, &mut fields_order_info);
+
+    let mut cursor_context = compute_cursor_context(&mapped_files, cursor_info);
+
     pre_process_typed_modules(
-        &typed_modules,
+        &typed_program.modules,
+        &fields_order_info,
         &mapped_files,
         &file_id_to_lines,
         &mut mod_outer_defs,
@@ -1436,11 +1786,13 @@ pub fn get_symbols(
         &mut references,
         &mut def_info,
         &edition,
+        cursor_context.as_mut(),
     );
 
     if let Some(libs) = compiled_libs.clone() {
         pre_process_typed_modules(
             &libs.typing.modules,
+            &fields_order_info,
             &mapped_files,
             &file_id_to_lines,
             &mut mod_outer_defs,
@@ -1448,6 +1800,7 @@ pub fn get_symbols(
             &mut references,
             &mut def_info,
             &edition,
+            None, // Cursor can never be in a compiled library(?)
         );
     }
 
@@ -1456,7 +1809,7 @@ pub fn get_symbols(
     let mut file_use_defs = BTreeMap::new();
     let mut mod_to_alias_lengths = BTreeMap::new();
 
-    let mut parsing_symbolicator = ParsingSymbolicator {
+    let mut parsing_symbolicator = parsing_analysis::ParsingAnalysisContext {
         mod_outer_defs: &mut mod_outer_defs,
         files: &mapped_files,
         references: &mut references,
@@ -1465,6 +1818,7 @@ pub fn get_symbols(
         current_mod_ident_str: None,
         alias_lengths: BTreeMap::new(),
         pkg_addresses: &NamedAddressMap::new(),
+        cursor: cursor_context.as_mut(),
     };
 
     parsing_symbolicator.prog_symbols(
@@ -1473,6 +1827,7 @@ pub fn get_symbols(
         &mut mod_to_alias_lengths,
     );
     if let Some(libs) = compiled_libs.clone() {
+        parsing_symbolicator.cursor = None;
         parsing_symbolicator.prog_symbols(
             &libs.parser,
             &mut mod_use_defs,
@@ -1482,11 +1837,12 @@ pub fn get_symbols(
 
     let mut compiler_info = compiler_info.unwrap();
     let mut typing_symbolicator = typing_analysis::TypingAnalysisContext {
-        mod_outer_defs: &mod_outer_defs,
+        mod_outer_defs: &mut mod_outer_defs,
         files: &mapped_files,
         references: &mut references,
         def_info: &mut def_info,
         use_defs: UseDefMap::new(),
+        current_mod_ident_str: None,
         alias_lengths: &BTreeMap::new(),
         traverse_only: false,
         compiler_info: &mut compiler_info,
@@ -1495,7 +1851,7 @@ pub fn get_symbols(
     };
 
     process_typed_modules(
-        &mut typed_modules,
+        &mut typed_program.modules,
         &source_files,
         &mod_to_alias_lengths,
         &mut typing_symbolicator,
@@ -1527,6 +1883,7 @@ pub fn get_symbols(
         def_info,
         files: mapped_files,
         compiler_info,
+        cursor_context,
     };
 
     eprintln!("get_symbols load complete");
@@ -1534,8 +1891,82 @@ pub fn get_symbols(
     Ok((Some(symbols), ide_diagnostics))
 }
 
+fn compute_cursor_context(
+    mapped_files: &MappedFiles,
+    cursor_info: Option<(&PathBuf, Position)>,
+) -> Option<CursorContext> {
+    let (path, pos) = cursor_info?;
+    let file_hash = mapped_files.file_hash(path)?;
+    let loc = lsp_position_to_loc(mapped_files, file_hash, &pos)?;
+    eprintln!("computed cursor loc");
+    Some(CursorContext::new(loc))
+}
+
+/// Pre-process parsed program to get initial info before AST traversals
+fn pre_process_parsed_program(prog: &P::Program, fields_order_info: &mut FieldOrderInfo) {
+    prog.source_definitions.iter().for_each(|pkg_def| {
+        pre_process_parsed_pkg(pkg_def, &prog.named_address_maps, fields_order_info);
+    });
+    prog.lib_definitions.iter().for_each(|pkg_def| {
+        pre_process_parsed_pkg(pkg_def, &prog.named_address_maps, fields_order_info);
+    });
+}
+
+/// Pre-process parsed package to get initial info before AST traversals
+fn pre_process_parsed_pkg(
+    pkg_def: &P::PackageDefinition,
+    named_address_maps: &NamedAddressMaps,
+    fields_order_info: &mut FieldOrderInfo,
+) {
+    if let P::Definition::Module(mod_def) = &pkg_def.def {
+        for member in &mod_def.members {
+            let pkg_addresses = named_address_maps.get(pkg_def.named_address_map);
+            let Some(mod_ident_str) = parsing_mod_def_to_map_key(pkg_addresses, mod_def) else {
+                continue;
+            };
+            if let P::ModuleMember::Struct(sdef) = member {
+                if let P::StructFields::Named(fields) = &sdef.fields {
+                    let indexed_fields = fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (f, _))| (f.value(), i))
+                        .collect::<BTreeMap<_, _>>();
+                    fields_order_info
+                        .structs
+                        .entry(mod_ident_str.clone())
+                        .or_default()
+                        .entry(sdef.name.value())
+                        .or_default()
+                        .extend(indexed_fields);
+                }
+            }
+            if let P::ModuleMember::Enum(edef) = member {
+                for vdef in &edef.variants {
+                    if let P::VariantFields::Named(fields) = &vdef.fields {
+                        let indexed_fields = fields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (f, _))| (f.value(), i))
+                            .collect::<BTreeMap<_, _>>();
+                        fields_order_info
+                            .variants
+                            .entry(mod_ident_str.clone())
+                            .or_default()
+                            .entry(edef.name.value())
+                            .or_default()
+                            .entry(vdef.name.value())
+                            .or_default()
+                            .extend(indexed_fields);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn pre_process_typed_modules(
     typed_modules: &UniqueMap<ModuleIdent, ModuleDefinition>,
+    fields_order_info: &FieldOrderInfo,
     files: &MappedFiles,
     file_id_to_lines: &HashMap<usize, Vec<String>>,
     mod_outer_defs: &mut BTreeMap<String, ModuleDefs>,
@@ -1543,13 +1974,23 @@ fn pre_process_typed_modules(
     references: &mut References,
     def_info: &mut DefMap,
     edition: &Option<Edition>,
+    mut cursor_context: Option<&mut CursorContext>,
 ) {
     for (pos, module_ident, module_def) in typed_modules {
+        // If the cursor is in this module, mark that down.
+        if let Some(cursor) = &mut cursor_context {
+            if module_def.loc.contains(&cursor.loc) {
+                cursor.module = Some(sp(pos, *module_ident));
+            }
+        };
+
         let mod_ident_str = expansion_mod_ident_to_map_key(module_ident);
         let (defs, symbols) = get_mod_outer_defs(
             &pos,
             &sp(pos, *module_ident),
+            mod_ident_str.clone(),
             module_def,
+            fields_order_info,
             files,
             file_id_to_lines,
             references,
@@ -1628,23 +2069,64 @@ fn file_sources(
         .collect()
 }
 
-/// Produces module ident string of the form pkg::module to be used as a map key.
-/// It's important that these are consistent between parsing AST and typed AST,
-fn parsing_mod_ident_to_map_key(
-    pkg_addresses: &NamedAddressMap,
-    mod_ident: &P::ModuleIdent_,
-) -> String {
-    format!(
-        "{}::{}",
-        parsed_address(mod_ident.address, pkg_addresses),
-        mod_ident.module
-    )
-    .to_string()
+/// Produces module ident string of the form pkg::module to be used as a map key
+/// It's important that these are consistent between parsing AST and typed AST.
+pub fn expansion_mod_ident_to_map_key(mod_ident: &E::ModuleIdent_) -> String {
+    use E::Address as A;
+    match mod_ident.address {
+        A::Numerical {
+            name,
+            value,
+            name_conflict: _,
+        } => {
+            if let Some(n) = name {
+                format!("({n}={value})::{}", mod_ident.module).to_string()
+            } else {
+                format!("{value}::{}", mod_ident.module).to_string()
+            }
+        }
+        A::NamedUnassigned(n) => format!("{n}::{}", mod_ident.module).to_string(),
+    }
+}
+
+/// Converts parsing AST's `LeadingNameAccess` to expansion AST's `Address` (similarly to
+/// expansion::translate::top_level_address but disregarding the name portion of `Address` as we
+/// only care about actual address here if it's available). We need this to be able to reliably
+/// compare parsing AST's module identifier with expansion/typing AST's module identifier, even in
+/// presence of module renaming (i.e., we cannot rely on module names if addresses are available).
+pub fn parsed_address(ln: P::LeadingNameAccess, pkg_addresses: &NamedAddressMap) -> E::Address {
+    let sp!(loc, ln_) = ln;
+    match ln_ {
+        P::LeadingNameAccess_::AnonymousAddress(bytes) => E::Address::anonymous(loc, bytes),
+        P::LeadingNameAccess_::GlobalAddress(name) => E::Address::NamedUnassigned(name),
+        P::LeadingNameAccess_::Name(name) => match pkg_addresses.get(&name.value).copied() {
+            // set `name_conflict` to `true` to force displaying (addr==pkg_name) so that the string
+            // representing map key is consistent with what's generated for expansion ModuleIdent in
+            // `expansion_mod_ident_to_map_key`
+            Some(addr) => E::Address::Numerical {
+                name: Some(name),
+                value: sp(loc, addr),
+                name_conflict: true,
+            },
+            None => E::Address::NamedUnassigned(name),
+        },
+    }
 }
 
 /// Produces module ident string of the form pkg::module to be used as a map key.
 /// It's important that these are consistent between parsing AST and typed AST.
-fn parsing_mod_def_to_map_key(
+pub fn parsing_leading_and_mod_names_to_map_key(
+    pkg_addresses: &NamedAddressMap,
+    ln: P::LeadingNameAccess,
+    name: P::ModuleName,
+) -> String {
+    let parsed_addr = parsed_address(ln, pkg_addresses);
+    format!("{}::{}", parsed_addr, name).to_string()
+}
+
+/// Produces module ident string of the form pkg::module to be used as a map key.
+/// It's important that these are consistent between parsing AST and typed AST.
+pub fn parsing_mod_def_to_map_key(
     pkg_addresses: &NamedAddressMap,
     mod_def: &P::ModuleDefinition,
 ) -> Option<String> {
@@ -1659,43 +2141,6 @@ fn parsing_mod_def_to_map_key(
         .map(|a| parsing_leading_and_mod_names_to_map_key(pkg_addresses, a, mod_def.name))
 }
 
-/// Produces module ident string of the form pkg::module to be used as a map key.
-/// It's important that these are consistent between parsing AST and typed AST.
-fn parsing_leading_and_mod_names_to_map_key(
-    pkg_addresses: &NamedAddressMap,
-    ln: P::LeadingNameAccess,
-    name: P::ModuleName,
-) -> String {
-    format!("{}::{}", parsed_address(ln, pkg_addresses), name).to_string()
-}
-
-/// Converts parsing AST's `LeadingNameAccess` to expansion AST's `Address` (similarly to
-/// expansion::translate::top_level_address but disregarding the name portion of `Address` as we
-/// only care about actual address here if it's available). We need this to be able to reliably
-/// compare parsing AST's module identifier with expansion/typing AST's module identifier, even in
-/// presence of module renaming (i.e., we cannot rely on module names if addresses are available).
-fn parsed_address(ln: P::LeadingNameAccess, pkg_addresses: &NamedAddressMap) -> E::Address {
-    let sp!(loc, ln_) = ln;
-    match ln_ {
-        P::LeadingNameAccess_::AnonymousAddress(bytes) => E::Address::anonymous(loc, bytes),
-        P::LeadingNameAccess_::GlobalAddress(name) => E::Address::NamedUnassigned(name),
-        P::LeadingNameAccess_::Name(name) => match pkg_addresses.get(&name.value).copied() {
-            Some(addr) => E::Address::anonymous(loc, addr),
-            None => E::Address::NamedUnassigned(name),
-        },
-    }
-}
-
-/// Produces module ident string of the form pkg::module to be used as a map key
-/// It's important that these are consistent between parsing AST and typed AST.
-pub fn expansion_mod_ident_to_map_key(mod_ident: &E::ModuleIdent_) -> String {
-    use E::Address as A;
-    match mod_ident.address {
-        A::Numerical { value, .. } => format!("{value}::{}", mod_ident.module).to_string(),
-        A::NamedUnassigned(n) => format!("{n}::{}", mod_ident.module).to_string(),
-    }
-}
-
 /// Get empty symbols
 pub fn empty_symbols() -> Symbols {
     Symbols {
@@ -1705,26 +2150,82 @@ pub fn empty_symbols() -> Symbols {
         def_info: BTreeMap::new(),
         files: MappedFiles::empty(),
         compiler_info: CompilerInfo::new(),
+        cursor_context: None,
     }
 }
 
-/// Some functions defined in a module need to be ignored.
-fn ignored_function(name: Symbol) -> bool {
-    // In test mode (that's how IDE compiles Move source files),
-    // the compiler inserts an dummy function preventing preventing
-    // publishing of modules compiled in test mode. We need to
-    // ignore its definition to avoid spurious on-hover display
-    // of this function's info whe hovering close to `module` keyword.
-    name == UNIT_TEST_POISON_FUN_NAME
+fn field_defs_and_types(
+    datatype_name: Symbol,
+    datatype_loc: Loc,
+    fields: &E::Fields<Type>,
+    fields_order_opt: Option<&BTreeMap<Symbol, usize>>,
+    mod_ident: &ModuleIdent,
+    files: &MappedFiles,
+    file_id_to_lines: &HashMap<usize, Vec<String>>,
+    def_info: &mut DefMap,
+) -> (Vec<FieldDef>, Vec<Type>) {
+    let mut field_defs = vec![];
+    let mut field_types = vec![];
+    let mut ordered_fields = fields
+        .iter()
+        .map(|(floc, fname, (_, ftype))| (floc, fname, ftype))
+        .collect::<Vec<_>>();
+    // sort fields by order if available for correct auto-completion
+    if let Some(fields_order) = fields_order_opt {
+        ordered_fields.sort_by_key(|(_, fname, _)| fields_order.get(fname).copied());
+    }
+    for (floc, fname, ftype) in ordered_fields {
+        field_defs.push(FieldDef {
+            name: *fname,
+            loc: floc,
+        });
+        let doc_string = extract_doc_string(files, file_id_to_lines, &floc, Some(datatype_loc));
+        def_info.insert(
+            floc,
+            DefInfo::Field(
+                mod_ident.value,
+                datatype_name,
+                *fname,
+                ftype.clone(),
+                doc_string,
+            ),
+        );
+        field_types.push(ftype.clone());
+    }
+    (field_defs, field_types)
 }
 
-/// Main AST traversal functions
+fn datatype_type_params(data_tparams: &[DatatypeTypeParameter]) -> Vec<(Type, /* phantom */ bool)> {
+    data_tparams
+        .iter()
+        .map(|t| {
+            (
+                sp(
+                    t.param.user_specified_name.loc,
+                    Type_::Param(t.param.clone()),
+                ),
+                t.is_phantom,
+            )
+        })
+        .collect()
+}
+
+/// Some functions defined in a module need to be ignored.
+pub fn ignored_function(name: Symbol) -> bool {
+    // In test mode (that's how IDE compiles Move source files), the compiler inserts an dummy
+    // function preventing publishing of modules compiled in test mode. We need to ignore its
+    // definition to avoid spurious on-hover display of this function's info whe hovering close to
+    // `module` keyword.
+    name == UNIT_TEST_POISON_FUN_NAME
+}
 
 /// Get symbols for outer definitions in the module (functions, structs, and consts)
 fn get_mod_outer_defs(
     loc: &Loc,
     mod_ident: &ModuleIdent,
+    mod_ident_str: String,
     mod_def: &ModuleDefinition,
+    fields_order_info: &FieldOrderInfo,
     files: &MappedFiles,
     file_id_to_lines: &HashMap<usize, Vec<String>>,
     references: &mut References,
@@ -1732,6 +2233,7 @@ fn get_mod_outer_defs(
     edition: &Option<Edition>,
 ) -> (ModuleDefs, UseDefMap) {
     let mut structs = BTreeMap::new();
+    let mut enums = BTreeMap::new();
     let mut constants = BTreeMap::new();
     let mut functions = BTreeMap::new();
 
@@ -1743,29 +2245,32 @@ fn get_mod_outer_defs(
         let mut field_types = vec![];
         if let StructFields::Defined(pos_fields, fields) = &def.fields {
             positional = *pos_fields;
-            for (floc, fname, (_, t)) in fields {
-                field_defs.push(FieldDef {
-                    name: *fname,
-                    loc: floc,
-                });
-                let doc_string = extract_doc_string(files, file_id_to_lines, &floc);
-                def_info.insert(
-                    floc,
-                    DefInfo::Field(mod_ident.value, *name, *fname, t.clone(), doc_string),
-                );
-                field_types.push(t.clone());
-            }
+            let fields_order_opt = fields_order_info
+                .structs
+                .get(&mod_ident_str)
+                .and_then(|s| s.get(name));
+            (field_defs, field_types) = field_defs_and_types(
+                *name,
+                name_loc,
+                fields,
+                fields_order_opt,
+                mod_ident,
+                files,
+                file_id_to_lines,
+                def_info,
+            );
         };
 
         // process the struct itself
-
-        let field_names = field_defs.iter().map(|f| f.name).collect();
+        let field_names = field_defs.iter().map(|f| sp(f.loc, f.name)).collect();
         structs.insert(
             *name,
-            StructDef {
+            MemberDef {
                 name_loc,
-                field_defs,
-                positional,
+                info: MemberDefInfo::Struct {
+                    field_defs,
+                    positional,
+                },
             },
         );
         let pub_struct = edition
@@ -1777,25 +2282,14 @@ fn get_mod_outer_defs(
         } else {
             Visibility::Internal
         };
-        let doc_string = extract_doc_string(files, file_id_to_lines, &name_loc);
+        let doc_string = extract_doc_string(files, file_id_to_lines, &name_loc, None);
         def_info.insert(
             name_loc,
             DefInfo::Struct(
                 mod_ident.value,
                 *name,
                 visibility,
-                def.type_parameters
-                    .iter()
-                    .map(|t| {
-                        (
-                            sp(
-                                t.param.user_specified_name.loc,
-                                Type_::Param(t.param.clone()),
-                            ),
-                            t.is_phantom,
-                        )
-                    })
-                    .collect(),
+                datatype_type_params(&def.type_parameters),
                 def.abilities.clone(),
                 field_names,
                 field_types,
@@ -1804,9 +2298,87 @@ fn get_mod_outer_defs(
         );
     }
 
+    for (name_loc, name, def) in &mod_def.enums {
+        // process variants
+        let mut variants_info = BTreeMap::new();
+        let mut def_info_variants = vec![];
+        for (vname_loc, vname, vdef) in &def.variants {
+            let (field_defs, field_types, positional) = match &vdef.fields {
+                VariantFields::Defined(pos_fields, fields) => {
+                    let fields_order_opt = fields_order_info
+                        .variants
+                        .get(&mod_ident_str)
+                        .and_then(|v| v.get(name))
+                        .and_then(|v| v.get(vname));
+                    let (defs, types) = field_defs_and_types(
+                        *name,
+                        name_loc,
+                        fields,
+                        fields_order_opt,
+                        mod_ident,
+                        files,
+                        file_id_to_lines,
+                        def_info,
+                    );
+                    (defs, types, *pos_fields)
+                }
+                VariantFields::Empty => (vec![], vec![], false),
+            };
+            let field_names = field_defs.iter().map(|f| sp(f.loc, f.name)).collect();
+            def_info_variants.push(VariantInfo {
+                name: sp(vname_loc, *vname),
+                empty: field_defs.is_empty(),
+                positional,
+            });
+            variants_info.insert(*vname, (vname_loc, field_defs, positional));
+
+            let vdoc_string =
+                extract_doc_string(files, file_id_to_lines, &vname_loc, Some(name_loc));
+            def_info.insert(
+                vname_loc,
+                DefInfo::Variant(
+                    mod_ident.value,
+                    *name,
+                    *vname,
+                    positional,
+                    field_names,
+                    field_types,
+                    vdoc_string,
+                ),
+            );
+        }
+        // process the enum itself
+        enums.insert(
+            *name,
+            MemberDef {
+                name_loc,
+                info: MemberDefInfo::Enum { variants_info },
+            },
+        );
+        let enum_doc_string = extract_doc_string(files, file_id_to_lines, &name_loc, None);
+        def_info.insert(
+            name_loc,
+            DefInfo::Enum(
+                mod_ident.value,
+                *name,
+                Visibility::Public(Loc::invalid()),
+                datatype_type_params(&def.type_parameters),
+                def.abilities.clone(),
+                def_info_variants,
+                enum_doc_string,
+            ),
+        );
+    }
+
     for (name_loc, name, c) in &mod_def.constants {
-        constants.insert(*name, ConstDef { name_loc });
-        let doc_string = extract_doc_string(files, file_id_to_lines, &name_loc);
+        constants.insert(
+            *name,
+            MemberDef {
+                name_loc,
+                info: MemberDefInfo::Const,
+            },
+        );
+        let doc_string = extract_doc_string(files, file_id_to_lines, &name_loc, None);
         def_info.insert(
             name_loc,
             DefInfo::Const(
@@ -1830,7 +2402,7 @@ fn get_mod_outer_defs(
         } else {
             FunType::Regular
         };
-        let doc_string = extract_doc_string(files, file_id_to_lines, &name_loc);
+        let doc_string = extract_doc_string(files, file_id_to_lines, &name_loc, None);
         let fun_info = DefInfo::Function(
             mod_ident.value,
             fun.visibility,
@@ -1844,7 +2416,7 @@ fn get_mod_outer_defs(
             fun.signature
                 .parameters
                 .iter()
-                .map(|(_, n, _)| n.value.name)
+                .map(|(_, n, _)| sp(n.loc, n.value.name))
                 .collect(),
             fun.signature
                 .parameters
@@ -1856,15 +2428,16 @@ fn get_mod_outer_defs(
         );
         functions.insert(
             *name,
-            FunctionDef {
-                name: *name,
+            MemberDef {
                 name_loc,
-                attrs: fun
-                    .attributes
-                    .clone()
-                    .iter()
-                    .map(|(_loc, name, _attr)| name.to_string())
-                    .collect(),
+                info: MemberDefInfo::Fun {
+                    attrs: fun
+                        .attributes
+                        .clone()
+                        .iter()
+                        .map(|(_loc, name, _attr)| name.to_string())
+                        .collect(),
+                },
             },
         );
         def_info.insert(name_loc, fun_info);
@@ -1873,16 +2446,17 @@ fn get_mod_outer_defs(
     let mut use_def_map = UseDefMap::new();
 
     let ident = mod_ident.value;
-
-    let doc_comment = extract_doc_string(files, file_id_to_lines, loc);
+    let doc_comment = extract_doc_string(files, file_id_to_lines, loc, None);
     let mod_defs = ModuleDefs {
         fhash,
         ident,
         name_loc: *loc,
         structs,
+        enums,
         constants,
         functions,
         untyped_defs: BTreeSet::new(),
+        call_infos: BTreeMap::new(),
     };
 
     // insert use of the module name in the definition itself
@@ -1909,553 +2483,46 @@ fn get_mod_outer_defs(
     (mod_defs, use_def_map)
 }
 
-impl<'a> ParsingSymbolicator<'a> {
-    /// Get symbols for the whole program
-    fn prog_symbols(
-        &mut self,
-        prog: &'a P::Program,
-        mod_use_defs: &mut BTreeMap<String, UseDefMap>,
-        mod_to_alias_lengths: &mut BTreeMap<String, BTreeMap<Position, usize>>,
-    ) {
-        prog.source_definitions.iter().for_each(|pkg_def| {
-            self.pkg_symbols(
-                &prog.named_address_maps,
-                pkg_def,
-                mod_use_defs,
-                mod_to_alias_lengths,
-            )
-        });
-        prog.lib_definitions.iter().for_each(|pkg_def| {
-            self.pkg_symbols(
-                &prog.named_address_maps,
-                pkg_def,
-                mod_use_defs,
-                mod_to_alias_lengths,
-            )
-        });
-    }
-
-    /// Get symbols for the whole package
-    fn pkg_symbols(
-        &mut self,
-        pkg_address_maps: &'a NamedAddressMaps,
-        pkg_def: &P::PackageDefinition,
-        mod_use_defs: &mut BTreeMap<String, UseDefMap>,
-        mod_to_alias_lengths: &mut BTreeMap<String, BTreeMap<Position, usize>>,
-    ) {
-        if let P::Definition::Module(mod_def) = &pkg_def.def {
-            let pkg_addresses = pkg_address_maps.get(pkg_def.named_address_map);
-            let old_addresses = std::mem::replace(&mut self.pkg_addresses, pkg_addresses);
-            self.mod_symbols(mod_def, mod_use_defs, mod_to_alias_lengths);
-            self.current_mod_ident_str = None;
-            let _ = std::mem::replace(&mut self.pkg_addresses, old_addresses);
-        }
-    }
-
-    /// Get symbols for the whole module
-    fn mod_symbols(
-        &mut self,
-        mod_def: &P::ModuleDefinition,
-        mod_use_defs: &mut BTreeMap<String, UseDefMap>,
-        mod_to_alias_lengths: &mut BTreeMap<String, BTreeMap<Position, usize>>,
-    ) {
-        // parsing symbolicator is currently only responsible for processing use declarations
-        let Some(mod_ident_str) = parsing_mod_def_to_map_key(self.pkg_addresses, mod_def) else {
-            return;
-        };
-        assert!(self.current_mod_ident_str.is_none());
-        self.current_mod_ident_str = Some(mod_ident_str.clone());
-
-        let use_defs = mod_use_defs.remove(&mod_ident_str).unwrap();
-        let old_defs = std::mem::replace(&mut self.use_defs, use_defs);
-        let alias_lengths: BTreeMap<Position, usize> = BTreeMap::new();
-        let old_alias_lengths = std::mem::replace(&mut self.alias_lengths, alias_lengths);
-
-        for m in &mod_def.members {
-            use P::ModuleMember as MM;
-            match m {
-                MM::Function(fun) => {
-                    if ignored_function(fun.name.value()) {
-                        continue;
-                    }
-                    fun.signature
-                        .parameters
-                        .iter()
-                        .for_each(|(_, _, t)| self.type_symbols(t));
-                    self.type_symbols(&fun.signature.return_type);
-                    if fun.macro_.is_some() {
-                        // we currently do not process macro function bodies
-                        // in the parsing symbolicator (and do very limited
-                        // processing in typing symbolicator)
-                        continue;
-                    }
-                    if let P::FunctionBody_::Defined(seq) = &fun.body.value {
-                        self.seq_symbols(seq);
-                    };
-                }
-                MM::Struct(sdef) => match &sdef.fields {
-                    P::StructFields::Named(v) => v.iter().for_each(|(_, t)| self.type_symbols(t)),
-                    P::StructFields::Positional(v) => v.iter().for_each(|t| self.type_symbols(t)),
-                    P::StructFields::Native(_) => (),
-                },
-                MM::Enum(edef) => {
-                    let P::EnumDefinition { variants, .. } = edef;
-                    for variant in variants {
-                        let P::VariantDefinition { fields, .. } = variant;
-                        match fields {
-                            P::VariantFields::Named(v) => {
-                                v.iter().for_each(|(_, t)| self.type_symbols(t))
-                            }
-                            P::VariantFields::Positional(v) => {
-                                v.iter().for_each(|t| self.type_symbols(t))
-                            }
-                            P::VariantFields::Empty => (),
-                        }
-                    }
-                }
-                MM::Use(use_decl) => self.use_decl_symbols(use_decl),
-                MM::Friend(fdecl) => self.chain_symbols(&fdecl.friend),
-                MM::Constant(c) => {
-                    self.type_symbols(&c.signature);
-                    self.exp_symbols(&c.value);
-                }
-                MM::Spec(_) => (),
-            }
-        }
-        self.current_mod_ident_str = None;
-        let processed_defs = std::mem::replace(&mut self.use_defs, old_defs);
-        mod_use_defs.insert(mod_ident_str.clone(), processed_defs);
-        let processed_alias_lengths = std::mem::replace(&mut self.alias_lengths, old_alias_lengths);
-        mod_to_alias_lengths.insert(mod_ident_str, processed_alias_lengths);
-    }
-
-    /// Get symbols for a sequence item
-    fn seq_item_symbols(&mut self, seq_item: &P::SequenceItem) {
-        use P::SequenceItem_ as I;
-        match &seq_item.value {
-            I::Seq(e) => self.exp_symbols(e),
-            I::Declare(v, to) => {
-                v.value
-                    .iter()
-                    .for_each(|bind| self.bind_symbols(bind, to.is_some()));
-                if let Some(t) = to {
-                    self.type_symbols(t);
-                }
-            }
-            I::Bind(v, to, e) => {
-                v.value
-                    .iter()
-                    .for_each(|bind| self.bind_symbols(bind, to.is_some()));
-                if let Some(t) = to {
-                    self.type_symbols(t);
-                }
-                self.exp_symbols(e);
-            }
-        }
-    }
-
-    fn path_entry_symbols(&mut self, path: &P::PathEntry) {
-        let P::PathEntry {
-            name: _,
-            tyargs,
-            is_macro: _,
-        } = path;
-        if let Some(sp!(_, tyargs)) = tyargs {
-            tyargs.iter().for_each(|t| self.type_symbols(t));
-        }
-    }
-
-    fn root_path_entry_symbols(&mut self, path: &P::RootPathEntry) {
-        let P::RootPathEntry {
-            name: _,
-            tyargs,
-            is_macro: _,
-        } = path;
-        if let Some(sp!(_, tyargs)) = tyargs {
-            tyargs.iter().for_each(|t| self.type_symbols(t));
-        }
-    }
-
-    /// Get symbols for an expression
-    fn exp_symbols(&mut self, sp!(_, exp): &P::Exp) {
-        use P::Exp_ as E;
-        match exp {
-            E::Move(_, e) => self.exp_symbols(e),
-            E::Copy(_, e) => self.exp_symbols(e),
-            E::Name(chain) => self.chain_symbols(chain),
-            E::Call(chain, v) => {
-                self.chain_symbols(chain);
-                v.value.iter().for_each(|e| self.exp_symbols(e));
-            }
-            E::Pack(chain, v) => {
-                self.chain_symbols(chain);
-                v.iter().for_each(|(_, e)| self.exp_symbols(e));
-            }
-            E::Vector(_, vo, v) => {
-                if let Some(v) = vo {
-                    v.iter().for_each(|t| self.type_symbols(t));
-                }
-                v.value.iter().for_each(|e| self.exp_symbols(e));
-            }
-            E::IfElse(e1, e2, oe) => {
-                self.exp_symbols(e1);
-                self.exp_symbols(e2);
-                if let Some(e) = oe.as_ref() {
-                    self.exp_symbols(e)
-                }
-            }
-            E::While(e1, e2) => {
-                self.exp_symbols(e1);
-                self.exp_symbols(e2);
-            }
-            E::Loop(e) => self.exp_symbols(e),
-            E::Labeled(_, e) => self.exp_symbols(e),
-            E::Block(seq) => self.seq_symbols(seq),
-            E::Lambda(sp!(_, bindings), to, e) => {
-                for (sp!(_, v), bto) in bindings {
-                    if let Some(bt) = bto {
-                        self.type_symbols(bt);
-                    }
-                    v.iter().for_each(|bind| self.bind_symbols(bind, to.is_some()));
-                }
-                if let Some(t) = to {
-                    self.type_symbols(t);
-                }
-                self.exp_symbols(e);
-            }
-            E::ExpList(l) => l.iter().for_each(|e| self.exp_symbols(e)),
-            E::Parens(e) => self.exp_symbols(e),
-            E::Assign(e1, e2) => {
-                self.exp_symbols(e1);
-                self.exp_symbols(e2);
-            }
-            E::Abort(e) => self.exp_symbols(e),
-            E::Return(_, oe) => {
-                if let Some(e) = oe.as_ref() {
-                    self.exp_symbols(e)
-                }
-            }
-            E::Break(_, oe) => {
-                if let Some(e) = oe.as_ref() {
-                    self.exp_symbols(e)
-                }
-            }
-            E::Dereference(e) => self.exp_symbols(e),
-            E::UnaryExp(_, e) => self.exp_symbols(e),
-            E::BinopExp(e1, _, e2) => {
-                self.exp_symbols(e1);
-                self.exp_symbols(e2);
-            }
-            E::Borrow(_, e) => self.exp_symbols(e),
-            E::Dot(e, _) => self.exp_symbols(e),
-            E::DotCall(e, _, _, vo, v) => {
-                self.exp_symbols(e);
-                if let Some(v) = vo {
-                    v.iter().for_each(|t| self.type_symbols(t));
-                }
-                v.value.iter().for_each(|e| self.exp_symbols(e));
-            }
-            E::Index(e, v) => {
-                self.exp_symbols(e);
-                v.value.iter().for_each(|e| self.exp_symbols(e));
-            }
-            E::Cast(e, t) => {
-                self.exp_symbols(e);
-                self.type_symbols(t);
-            }
-            E::Annotate(e, t) => {
-                self.exp_symbols(e);
-                self.type_symbols(t);
-            }
-            E::DotUnresolved(_, e) => self.exp_symbols(e),
-            E::Value(_)
-            | E::Quant(..)
-            | E::Unit
-            | E::Continue(_)
-            | E::Spec(_)
-            | E::Match(_, _) // TODO support it
-            | E::UnresolvedError
-            => (),
-        }
-    }
-
-    /// Get symbols for a sequence
-    fn seq_symbols(&mut self, (use_decls, seq_items, _, oe): &P::Sequence) {
-        use_decls
-            .iter()
-            .for_each(|use_decl| self.use_decl_symbols(use_decl));
-
-        seq_items
-            .iter()
-            .for_each(|seq_item| self.seq_item_symbols(seq_item));
-        if let Some(e) = oe.as_ref().as_ref() {
-            self.exp_symbols(e)
-        }
-    }
-
-    /// Get symbols for a use declaration
-    fn use_decl_symbols(&mut self, use_decl: &P::UseDecl) {
-        match &use_decl.use_ {
-            P::Use::ModuleUse(mod_ident, mod_use) => {
-                let mod_ident_str =
-                    parsing_mod_ident_to_map_key(self.pkg_addresses, &mod_ident.value);
-                self.mod_name_symbol(&mod_ident.value.module, &mod_ident_str);
-                self.mod_use_symbols(mod_use, &mod_ident_str);
-            }
-            P::Use::NestedModuleUses(leading_name, uses) => {
-                for (mod_name, mod_use) in uses {
-                    let mod_ident_str = parsing_leading_and_mod_names_to_map_key(
-                        self.pkg_addresses,
-                        *leading_name,
-                        *mod_name,
-                    );
-
-                    self.mod_name_symbol(mod_name, &mod_ident_str);
-                    self.mod_use_symbols(mod_use, &mod_ident_str);
-                }
-            }
-            P::Use::Fun {
-                visibility: _,
-                function,
-                ty,
-                method: _,
-            } => {
-                self.chain_symbols(function);
-                self.chain_symbols(ty);
-            }
-        }
-    }
-
-    /// Get module name symbol
-    fn mod_name_symbol(&mut self, mod_name: &P::ModuleName, mod_ident_str: &String) {
-        let Some(mod_defs) = self.mod_outer_defs.get_mut(mod_ident_str) else {
-            return;
-        };
-        let Some(mod_name_start) = loc_start_to_lsp_position_opt(self.files, &mod_name.loc())
-        else {
-            debug_assert!(false);
-            return;
-        };
-        self.use_defs.insert(
-            mod_name_start.line,
-            UseDef::new(
-                self.references,
-                &BTreeMap::new(),
-                mod_name.loc().file_hash(),
-                mod_name_start,
-                mod_defs.name_loc,
-                &mod_name.value(),
-                None,
-            ),
-        );
-    }
-
-    /// Get symbols for a module use
-    fn mod_use_symbols(&mut self, mod_use: &P::ModuleUse, mod_ident_str: &String) {
-        match mod_use {
-            P::ModuleUse::Module(Some(alias_name)) => {
-                self.mod_name_symbol(alias_name, mod_ident_str);
-            }
-            P::ModuleUse::Module(None) => (), // nothing more to do
-            P::ModuleUse::Members(v) => {
-                for (name, alias_opt) in v {
-                    self.use_decl_member_symbols(mod_ident_str.clone(), name, alias_opt);
-                }
-            }
-        }
-    }
-
-    /// Get symbols for a module member in the use declaration (can be a struct or a function)
-    fn use_decl_member_symbols(
-        &mut self,
-        mod_ident_str: String,
-        name: &Name,
-        alias_opt: &Option<Name>,
-    ) {
-        let Some(mod_defs) = self.mod_outer_defs.get(&mod_ident_str) else {
-            return;
-        };
-        if let Some(mut ud) = add_struct_use_def(
-            self.mod_outer_defs,
-            self.files,
-            mod_defs,
-            &name.value,
-            &name.loc,
-            self.references,
-            self.def_info,
-            &mut self.use_defs,
-            &BTreeMap::new(),
-        ) {
-            // it's a struct - add it for the alias as well
-            if let Some(alias) = alias_opt {
-                let Some(alias_start) = loc_start_to_lsp_position_opt(self.files, &alias.loc)
-                else {
-                    debug_assert!(false);
-                    return;
-                };
-                ud.rename_use(
-                    self.references,
-                    alias.value,
-                    alias_start,
-                    alias.loc.file_hash(),
-                );
-                self.use_defs.insert(alias_start.line, ud);
-            }
-            return;
-        }
-        if let Some(mut ud) = add_fun_use_def(
-            &name.value,
-            self.mod_outer_defs,
-            self.files,
-            mod_defs,
-            &name.value,
-            &name.loc,
-            self.references,
-            self.def_info,
-            &mut self.use_defs,
-            &BTreeMap::new(),
-        ) {
-            // it's a function - add it for the alias as well
-            if let Some(alias) = alias_opt {
-                let Some(alias_start) = loc_start_to_lsp_position_opt(self.files, &alias.loc)
-                else {
-                    debug_assert!(false);
-                    return;
-                };
-                ud.rename_use(
-                    self.references,
-                    alias.value,
-                    alias_start,
-                    alias.loc.file_hash(),
-                );
-                self.use_defs.insert(alias_start.line, ud);
-            }
-        }
-    }
-
-    /// Get symbols for a type
-    fn type_symbols(&mut self, sp!(_, t): &P::Type) {
-        use P::Type_ as T;
-        match t {
-            T::Apply(chain) => {
-                self.chain_symbols(chain);
-            }
-            T::Ref(_, t) => self.type_symbols(t),
-            T::Fun(v, t) => {
-                v.iter().for_each(|t| self.type_symbols(t));
-                self.type_symbols(t);
-            }
-            T::Multiple(v) => v.iter().for_each(|t| self.type_symbols(t)),
-            T::Unit => (),
-            T::UnresolvedError => (),
-        }
-    }
-
-    /// Get symbols for a bind statement
-    fn bind_symbols(&mut self, sp!(_, bind): &P::Bind, explicitly_typed: bool) {
-        use P::Bind_ as B;
-        match bind {
-            B::Unpack(chain, bindings) => {
-                self.chain_symbols(chain);
-                match bindings {
-                    P::FieldBindings::Named(v) => {
-                        for symbol in v {
-                            match symbol {
-                                P::Ellipsis::Binder((_, x)) => self.bind_symbols(x, false),
-                                P::Ellipsis::Ellipsis(_) => (),
-                            }
-                        }
-                    }
-                    P::FieldBindings::Positional(v) => {
-                        for symbol in v.iter() {
-                            match symbol {
-                                P::Ellipsis::Binder(x) => self.bind_symbols(x, false),
-                                P::Ellipsis::Ellipsis(_) => (),
-                            }
-                        }
-                    }
-                }
-            }
-            B::Var(_, var) => {
-                if !explicitly_typed {
-                    assert!(self.current_mod_ident_str.is_some());
-                    let Some(mod_defs) = self
-                        .mod_outer_defs
-                        .get_mut(&self.current_mod_ident_str.clone().unwrap())
-                    else {
-                        return;
-                    };
-                    mod_defs.untyped_defs.insert(var.loc());
-                }
-            }
-        }
-    }
-
-    /// Get symbols for a name access chain
-    fn chain_symbols(&mut self, sp!(_, chain): &P::NameAccessChain) {
-        use P::NameAccessChain_ as NA;
-        // record the length of an identifier representing a potentially
-        // aliased module, struct or function  name in an access chain,
-        let no = match chain {
-            NA::Single(entry) => {
-                self.path_entry_symbols(entry);
-                Some(entry.name)
-            }
-            NA::Path(path) => {
-                let P::NamePath { root, entries } = path;
-                self.root_path_entry_symbols(root);
-                entries
-                    .iter()
-                    .for_each(|entry| self.path_entry_symbols(entry));
-                // FIXME: this is a hack that will break when we add enums
-                if entries.len() < 2 {
-                    if let P::LeadingNameAccess_::Name(n) = root.name.value {
-                        Some(n)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-        let Some(n) = no else {
-            return;
-        };
-        let sp!(pos, name) = n;
-        let Some(loc) = loc_start_to_lsp_position_opt(self.files, &pos) else {
-            return;
-        };
-        self.alias_lengths.insert(loc, name.len());
-    }
-}
-
-/// Add use of a function identifier
-pub fn add_fun_use_def(
-    fun_def_name: &Symbol, // may be different from use_name for methods
-    mod_outer_defs: &BTreeMap<String, ModuleDefs>,
+/// Add use of a function, method, struct or enum identifier
+pub fn add_member_use_def(
+    member_def_name: &Symbol, // may be different from use_name for methods
     files: &MappedFiles,
     mod_defs: &ModuleDefs,
     use_name: &Symbol,
-    use_pos: &Loc,
+    use_loc: &Loc,
     references: &mut References,
     def_info: &DefMap,
     use_defs: &mut UseDefMap,
     alias_lengths: &BTreeMap<Position, usize>,
 ) -> Option<UseDef> {
-    let Some(name_start) = loc_start_to_lsp_position_opt(files, use_pos) else {
+    let Some(name_file_start) = files.start_position_opt(use_loc) else {
         debug_assert!(false);
         return None;
     };
-    if let Some(func_def) = mod_defs.functions.get(fun_def_name) {
-        let fun_info = def_info.get(&func_def.name_loc).unwrap();
-        let ident_type_def_loc = def_info_to_type_def_loc(mod_outer_defs, fun_info);
+    let name_start = Position {
+        line: name_file_start.line_offset() as u32,
+        character: name_file_start.column_offset() as u32,
+    };
+    if let Some(member_def) = mod_defs
+        .functions
+        .get(member_def_name)
+        .or_else(|| mod_defs.structs.get(member_def_name))
+        .or_else(|| mod_defs.enums.get(member_def_name))
+    {
+        let member_info = def_info.get(&member_def.name_loc).unwrap();
+        // type def location exists only for structs and enums (and not for functions)
+        let ident_type_def_loc = match member_info {
+            DefInfo::Struct(_, name, ..) | DefInfo::Enum(_, name, ..) => {
+                find_datatype(mod_defs, name)
+            }
+            _ => None,
+        };
         let ud = UseDef::new(
             references,
             alias_lengths,
-            use_pos.file_hash(),
+            use_loc.file_hash(),
             name_start,
-            func_def.name_loc,
+            member_def.name_loc,
             use_name,
             ident_type_def_loc,
         );
@@ -2463,55 +2530,6 @@ pub fn add_fun_use_def(
         return Some(ud);
     }
     None
-}
-
-/// Add use of a struct identifier
-pub fn add_struct_use_def(
-    mod_outer_defs: &BTreeMap<String, ModuleDefs>,
-    files: &MappedFiles,
-    mod_defs: &ModuleDefs,
-    use_name: &Symbol,
-    use_pos: &Loc,
-    references: &mut References,
-    def_info: &DefMap,
-    use_defs: &mut UseDefMap,
-    alias_lengths: &BTreeMap<Position, usize>,
-) -> Option<UseDef> {
-    let Some(name_start) = loc_start_to_lsp_position_opt(files, use_pos) else {
-        debug_assert!(false);
-        return None;
-    };
-    if let Some(def) = mod_defs.structs.get(use_name) {
-        let struct_info = def_info.get(&def.name_loc).unwrap();
-        let ident_type_def_loc = def_info_to_type_def_loc(mod_outer_defs, struct_info);
-        let ud = UseDef::new(
-            references,
-            alias_lengths,
-            use_pos.file_hash(),
-            name_start,
-            def.name_loc,
-            use_name,
-            ident_type_def_loc,
-        );
-        use_defs.insert(name_start.line, ud.clone());
-        return Some(ud);
-    }
-    None
-}
-
-pub fn def_info_to_type_def_loc(
-    mod_outer_defs: &BTreeMap<String, ModuleDefs>,
-    def_info: &DefInfo,
-) -> Option<Loc> {
-    match def_info {
-        DefInfo::Type(t) => type_def_loc(mod_outer_defs, t),
-        DefInfo::Function(..) => None,
-        DefInfo::Struct(mod_ident, name, ..) => find_struct(mod_outer_defs, mod_ident, name),
-        DefInfo::Field(.., t, _) => type_def_loc(mod_outer_defs, t),
-        DefInfo::Local(_, t, _, _) => type_def_loc(mod_outer_defs, t),
-        DefInfo::Const(_, _, t, _, _) => type_def_loc(mod_outer_defs, t),
-        DefInfo::Module(..) => None,
-    }
 }
 
 pub fn def_info_doc_string(def_info: &DefInfo) -> Option<String> {
@@ -2519,6 +2537,8 @@ pub fn def_info_doc_string(def_info: &DefInfo) -> Option<String> {
         DefInfo::Type(_) => None,
         DefInfo::Function(.., s) => s.clone(),
         DefInfo::Struct(.., s) => s.clone(),
+        DefInfo::Enum(.., s) => s.clone(),
+        DefInfo::Variant(.., s) => s.clone(),
         DefInfo::Field(.., s) => s.clone(),
         DefInfo::Local(..) => None,
         DefInfo::Const(.., s) => s.clone(),
@@ -2533,23 +2553,25 @@ pub fn type_def_loc(
     match t {
         Type_::Ref(_, r) => type_def_loc(mod_outer_defs, r),
         Type_::Apply(_, sp!(_, TypeName_::ModuleType(sp!(_, mod_ident), struct_name)), _) => {
-            find_struct(mod_outer_defs, mod_ident, &struct_name.value())
+            let mod_ident_str = expansion_mod_ident_to_map_key(mod_ident);
+            mod_outer_defs
+                .get(&mod_ident_str)
+                .and_then(|mod_defs| find_datatype(mod_defs, &struct_name.value()))
         }
         _ => None,
     }
 }
 
-fn find_struct(
-    mod_outer_defs: &BTreeMap<String, ModuleDefs>,
-    mod_ident: &ModuleIdent_,
-    struct_name: &Symbol,
-) -> Option<Loc> {
-    let mod_ident_str = expansion_mod_ident_to_map_key(mod_ident);
-    let mod_defs = match mod_outer_defs.get(&mod_ident_str) {
-        Some(v) => v,
-        None => return None,
-    };
-    mod_defs.structs.get(struct_name).map(|sdef| sdef.name_loc)
+pub fn find_datatype(mod_defs: &ModuleDefs, datatype_name: &Symbol) -> Option<Loc> {
+    mod_defs.structs.get(datatype_name).map_or_else(
+        || {
+            mod_defs
+                .enums
+                .get(datatype_name)
+                .map(|enum_def| enum_def.name_loc)
+        },
+        |struct_def| Some(struct_def.name_loc),
+    )
 }
 
 /// Extracts the docstring (/// or /** ... */) for a given definition by traversing up from the line definition
@@ -2557,11 +2579,28 @@ fn extract_doc_string(
     files: &MappedFiles,
     file_id_to_lines: &HashMap<FileId, Vec<String>>,
     loc: &Loc,
+    outer_def_loc: Option<Loc>,
 ) -> Option<String> {
     let file_hash = loc.file_hash();
     let file_id = files.file_hash_to_file_id(&file_hash)?;
     let start_position = files.start_position_opt(loc)?;
     let file_lines = file_id_to_lines.get(&file_id)?;
+
+    if let Some(outer_loc) = outer_def_loc {
+        if let Some(outer_pos) = files.start_position_opt(&outer_loc) {
+            if outer_pos.line_offset() == start_position.line_offset() {
+                // It's a bit of a hack but due to the way we extract doc strings
+                // we should not do it for a definition if this definition is placed
+                // on the same line as another (outer) one as this way we'd pick
+                // doc comment of the outer definition. For example (where field
+                // of the struct would pick up struct's doc comment)
+                //
+                // /// Struct doc comment
+                // public struct Tmp { field: u64 }
+                return None;
+            }
+        }
+    }
 
     if start_position.line_offset() == 0 {
         return None;
@@ -2625,7 +2664,8 @@ fn extract_doc_string(
 }
 
 /// Handles go-to-def request of the language server
-pub fn on_go_to_def_request(context: &Context, request: &Request, symbols: &Symbols) {
+pub fn on_go_to_def_request(context: &Context, request: &Request) {
+    let symbols_map = &context.symbols.lock().unwrap();
     let parameters = serde_json::from_value::<GotoDefinitionParams>(request.params.clone())
         .expect("could not deserialize go-to-def request");
 
@@ -2641,12 +2681,12 @@ pub fn on_go_to_def_request(context: &Context, request: &Request, symbols: &Symb
 
     on_use_request(
         context,
-        symbols,
+        symbols_map,
         &fpath,
         line,
         col,
         request.id.clone(),
-        |u| {
+        |u, symbols| {
             let loc = def_ide_location(&u.def_loc, symbols);
             Some(serde_json::to_value(loc).unwrap())
         },
@@ -2670,7 +2710,8 @@ pub fn def_ide_location(def_loc: &Loc, symbols: &Symbols) -> Location {
 }
 
 /// Handles go-to-type-def request of the language server
-pub fn on_go_to_type_def_request(context: &Context, request: &Request, symbols: &Symbols) {
+pub fn on_go_to_type_def_request(context: &Context, request: &Request) {
+    let symbols_map = &context.symbols.lock().unwrap();
     let parameters = serde_json::from_value::<GotoTypeDefinitionParams>(request.params.clone())
         .expect("could not deserialize go-to-type-def request");
 
@@ -2686,23 +2727,23 @@ pub fn on_go_to_type_def_request(context: &Context, request: &Request, symbols: 
 
     on_use_request(
         context,
-        symbols,
+        symbols_map,
         &fpath,
         line,
         col,
         request.id.clone(),
-        |u| match u.type_def_loc {
-            Some(def_loc) => {
+        |u, symbols| {
+            u.type_def_loc.map(|def_loc| {
                 let loc = def_ide_location(&def_loc, symbols);
-                Some(serde_json::to_value(loc).unwrap())
-            }
-            None => Some(serde_json::to_value(Option::<lsp_types::Location>::None).unwrap()),
+                serde_json::to_value(loc).unwrap()
+            })
         },
     );
 }
 
 /// Handles go-to-references request of the language server
-pub fn on_references_request(context: &Context, request: &Request, symbols: &Symbols) {
+pub fn on_references_request(context: &Context, request: &Request) {
+    let symbols_map = &context.symbols.lock().unwrap();
     let parameters = serde_json::from_value::<ReferenceParams>(request.params.clone())
         .expect("could not deserialize references request");
 
@@ -2719,15 +2760,17 @@ pub fn on_references_request(context: &Context, request: &Request, symbols: &Sym
 
     on_use_request(
         context,
-        symbols,
+        symbols_map,
         &fpath,
         line,
         col,
         request.id.clone(),
-        |u| {
+        |u, symbols| {
             let def_posn = symbols.files.file_start_position_opt(&u.def_loc)?;
-            match symbols.references.get(&u.def_loc) {
-                Some(s) => {
+            symbols
+                .references
+                .get(&u.def_loc)
+                .map(|s| {
                     let mut locs = vec![];
 
                     for ref_loc in s {
@@ -2750,20 +2793,43 @@ pub fn on_references_request(context: &Context, request: &Request, symbols: &Sym
                             });
                         }
                     }
-                    if locs.is_empty() {
-                        Some(serde_json::to_value(Option::<lsp_types::Location>::None).unwrap())
-                    } else {
-                        Some(serde_json::to_value(locs).unwrap())
-                    }
-                }
-                None => Some(serde_json::to_value(Option::<lsp_types::Location>::None).unwrap()),
-            }
+                    locs
+                })
+                .map(|locs| serde_json::to_value(locs).unwrap())
         },
     );
 }
 
+/// Helper function that take a DefInfo, checks if it represents
+/// a enum arm variable defintion, and if need be converts it
+/// to the one that represents an enum guard variable (which
+/// has immutable reference type regarldes of arm variable definition
+/// type).
+pub fn maybe_convert_for_guard(
+    def_info: &DefInfo,
+    use_fpath: &Path,
+    position: &Position,
+    symbols: &Symbols,
+) -> Option<DefInfo> {
+    let DefInfo::Local(name, ty, is_let, is_mut, guard_loc) = def_info else {
+        return None;
+    };
+    let gloc = (*guard_loc)?;
+    let fhash = symbols.file_hash(use_fpath)?;
+    let loc = lsp_position_to_loc(&symbols.files, fhash, position)?;
+    if symbols.compiler_info.inside_guard(fhash, &loc, &gloc) {
+        let new_ty = sp(
+            ty.loc,
+            Type_::Ref(false, Box::new(sp(ty.loc, ty.value.base_type_()))),
+        );
+        return Some(DefInfo::Local(*name, new_ty, *is_let, *is_mut, *guard_loc));
+    }
+    None
+}
+
 /// Handles hover request of the language server
-pub fn on_hover_request(context: &Context, request: &Request, symbols: &Symbols) {
+pub fn on_hover_request(context: &Context, request: &Request) {
+    let symbols_map = &context.symbols.lock().unwrap();
     let parameters = serde_json::from_value::<HoverParams>(request.params.clone())
         .expect("could not deserialize hover request");
 
@@ -2779,17 +2845,21 @@ pub fn on_hover_request(context: &Context, request: &Request, symbols: &Symbols)
 
     on_use_request(
         context,
-        symbols,
+        symbols_map,
         &fpath,
         line,
         col,
         request.id.clone(),
-        |u| {
+        |u, symbols| {
             let Some(info) = symbols.def_info.get(&u.def_loc) else {
                 return Some(serde_json::to_value(Option::<lsp_types::Location>::None).unwrap());
             };
-            // use rust for highlighting in Markdown until there is support for Move
-            let contents = HoverContents::Markup(on_hover_markup(info));
+            let contents =
+                if let Some(guard_info) = maybe_convert_for_guard(info, &fpath, &loc, symbols) {
+                    HoverContents::Markup(on_hover_markup(&guard_info))
+                } else {
+                    HoverContents::Markup(on_hover_markup(info))
+                };
             let range = None;
             Some(serde_json::to_value(Hover { contents, range }).unwrap())
         },
@@ -2797,6 +2867,7 @@ pub fn on_hover_request(context: &Context, request: &Request, symbols: &Symbols)
 }
 
 pub fn on_hover_markup(info: &DefInfo) -> MarkupContent {
+    // use rust for highlighting in Markdown until there is support for Move
     let value = if let Some(s) = &def_info_doc_string(info) {
         format!("```rust\n{}\n```\n{}", info, s)
     } else {
@@ -2811,32 +2882,37 @@ pub fn on_hover_markup(info: &DefInfo) -> MarkupContent {
 /// Helper function to handle language server queries related to identifier uses
 pub fn on_use_request(
     context: &Context,
-    symbols: &Symbols,
+    symbols_map: &BTreeMap<PathBuf, Symbols>,
     use_fpath: &PathBuf,
     use_line: u32,
     use_col: u32,
     id: RequestId,
-    use_def_action: impl Fn(&UseDef) -> Option<serde_json::Value>,
+    use_def_action: impl Fn(&UseDef, &Symbols) -> Option<serde_json::Value>,
 ) {
     let mut result = None;
 
-    let mut use_def_found = false;
-
-    if let Some(mod_symbols) = symbols.file_use_defs.get(use_fpath) {
-        if let Some(uses) = mod_symbols.get(use_line) {
-            for u in uses {
-                if use_col >= u.col_start && use_col <= u.col_end {
-                    result = use_def_action(&u);
-                    use_def_found = true;
+    if let Some(symbols) =
+        SymbolicatorRunner::root_dir(use_fpath).and_then(|pkg_path| symbols_map.get(&pkg_path))
+    {
+        if let Some(mod_symbols) = symbols.file_use_defs.get(use_fpath) {
+            if let Some(uses) = mod_symbols.get(use_line) {
+                for u in uses {
+                    if use_col >= u.col_start && use_col <= u.col_end {
+                        result = use_def_action(&u, symbols);
+                    }
                 }
             }
         }
     }
-    if !use_def_found {
+    eprintln!(
+        "about to send use response (symbols found: {})",
+        result.is_some()
+    );
+
+    if result.is_none() {
         result = Some(serde_json::to_value(Option::<lsp_types::Location>::None).unwrap());
     }
 
-    eprintln!("about to send use response (symbols found: {use_def_found})");
     // unwrap will succeed based on the logic above which the compiler is unable to figure out
     // without using Option
     let response = lsp_server::Response::new_ok(id, result.unwrap());
@@ -2851,103 +2927,124 @@ pub fn on_use_request(
 
 /// Handles document symbol request of the language server
 #[allow(deprecated)]
-pub fn on_document_symbol_request(context: &Context, request: &Request, symbols: &Symbols) {
+pub fn on_document_symbol_request(context: &Context, request: &Request) {
+    let symbols_map = &context.symbols.lock().unwrap();
     let parameters = serde_json::from_value::<DocumentSymbolParams>(request.params.clone())
         .expect("could not deserialize document symbol request");
 
     let fpath = parameters.text_document.uri.to_file_path().unwrap();
     eprintln!("on_document_symbol_request: {:?}", fpath);
 
-    let empty_mods: BTreeSet<ModuleDefs> = BTreeSet::new();
-    let mods = symbols.file_mods.get(&fpath).unwrap_or(&empty_mods);
-
     let mut defs: Vec<DocumentSymbol> = vec![];
-    for mod_def in mods {
-        let name = mod_def.ident.module.clone().to_string();
-        let detail = Some(mod_def.ident.clone().to_string());
-        let kind = SymbolKind::MODULE;
-        let Some(range) = symbols.files.lsp_range_opt(&mod_def.name_loc) else {
-            continue;
-        };
+    if let Some(symbols) =
+        SymbolicatorRunner::root_dir(&fpath).and_then(|pkg_path| symbols_map.get(&pkg_path))
+    {
+        let empty_mods: BTreeSet<ModuleDefs> = BTreeSet::new();
+        let mods = symbols.file_mods.get(&fpath).unwrap_or(&empty_mods);
 
-        let mut children = vec![];
-
-        // handle constants
-        let cloned_const_def = mod_def.constants.clone();
-        for (sym, const_def) in cloned_const_def {
-            let Some(const_range) = symbols.files.lsp_range_opt(&const_def.name_loc) else {
-                continue;
-            };
-            children.push(DocumentSymbol {
-                name: sym.clone().to_string(),
-                detail: None,
-                kind: SymbolKind::CONSTANT,
-                range: const_range,
-                selection_range: const_range,
-                children: None,
-                tags: Some(vec![]),
-                deprecated: Some(false),
-            });
-        }
-
-        // handle structs
-        let cloned_struct_def = mod_def.structs.clone();
-        for (sym, struct_def) in cloned_struct_def {
-            let Some(struct_range) = symbols.files.lsp_range_opt(&struct_def.name_loc) else {
+        for mod_def in mods {
+            let name = mod_def.ident.module.clone().to_string();
+            let detail = Some(mod_def.ident.clone().to_string());
+            let kind = SymbolKind::MODULE;
+            let Some(range) = symbols.files.lsp_range_opt(&mod_def.name_loc) else {
                 continue;
             };
 
-            let mut fields: Vec<DocumentSymbol> = vec![];
-            handle_struct_fields(struct_def, &mut fields, symbols);
+            let mut children = vec![];
 
-            children.push(DocumentSymbol {
-                name: sym.clone().to_string(),
-                detail: None,
-                kind: SymbolKind::STRUCT,
-                range: struct_range,
-                selection_range: struct_range,
-                children: Some(fields),
-                tags: Some(vec![]),
-                deprecated: Some(false),
-            });
-        }
-
-        // handle functions
-        let cloned_func_def = mod_def.functions.clone();
-        for (sym, func_def) in cloned_func_def {
-            let Some(func_range) = symbols.files.lsp_range_opt(&func_def.name_loc) else {
-                continue;
-            };
-
-            let mut detail = None;
-            if !func_def.attrs.is_empty() {
-                detail = Some(format!("{:?}", func_def.attrs));
+            // handle constants
+            for (sym, const_def) in &mod_def.constants {
+                let Some(const_range) = symbols.files.lsp_range_opt(&const_def.name_loc) else {
+                    continue;
+                };
+                children.push(DocumentSymbol {
+                    name: sym.clone().to_string(),
+                    detail: None,
+                    kind: SymbolKind::CONSTANT,
+                    range: const_range,
+                    selection_range: const_range,
+                    children: None,
+                    tags: Some(vec![]),
+                    deprecated: Some(false),
+                });
             }
 
-            children.push(DocumentSymbol {
-                name: sym.clone().to_string(),
+            // handle structs
+            for (sym, struct_def) in &mod_def.structs {
+                let Some(struct_range) = symbols.files.lsp_range_opt(&struct_def.name_loc) else {
+                    continue;
+                };
+
+                let fields = struct_field_symbols(struct_def, symbols);
+                children.push(DocumentSymbol {
+                    name: sym.clone().to_string(),
+                    detail: None,
+                    kind: SymbolKind::STRUCT,
+                    range: struct_range,
+                    selection_range: struct_range,
+                    children: Some(fields),
+                    tags: Some(vec![]),
+                    deprecated: Some(false),
+                });
+            }
+
+            // handle enums
+            for (sym, enum_def) in &mod_def.enums {
+                let Some(enum_range) = symbols.files.lsp_range_opt(&enum_def.name_loc) else {
+                    continue;
+                };
+
+                let variants = enum_variant_symbols(enum_def, symbols);
+                children.push(DocumentSymbol {
+                    name: sym.clone().to_string(),
+                    detail: None,
+                    kind: SymbolKind::ENUM,
+                    range: enum_range,
+                    selection_range: enum_range,
+                    children: Some(variants),
+                    tags: Some(vec![]),
+                    deprecated: Some(false),
+                });
+            }
+
+            // handle functions
+            for (sym, func_def) in &mod_def.functions {
+                let MemberDefInfo::Fun { attrs } = &func_def.info else {
+                    continue;
+                };
+                let Some(func_range) = symbols.files.lsp_range_opt(&func_def.name_loc) else {
+                    continue;
+                };
+
+                let mut detail = None;
+                if !attrs.is_empty() {
+                    detail = Some(format!("{:?}", attrs));
+                }
+
+                children.push(DocumentSymbol {
+                    name: sym.clone().to_string(),
+                    detail,
+                    kind: SymbolKind::FUNCTION,
+                    range: func_range,
+                    selection_range: func_range,
+                    children: None,
+                    tags: Some(vec![]),
+                    deprecated: Some(false),
+                });
+            }
+
+            defs.push(DocumentSymbol {
+                name,
                 detail,
-                kind: SymbolKind::FUNCTION,
-                range: func_range,
-                selection_range: func_range,
-                children: None,
+                kind,
+                range,
+                selection_range: range,
+                children: Some(children),
                 tags: Some(vec![]),
                 deprecated: Some(false),
             });
         }
-
-        defs.push(DocumentSymbol {
-            name,
-            detail,
-            kind,
-            range,
-            selection_range: range,
-            children: Some(children),
-            tags: Some(vec![]),
-            deprecated: Some(false),
-        });
     }
-
     // unwrap will succeed based on the logic above which the compiler is unable to figure out
     let response = lsp_server::Response::new_ok(request.id.clone(), defs);
     if let Err(err) = context
@@ -2959,29 +3056,56 @@ pub fn on_document_symbol_request(context: &Context, request: &Request, symbols:
     }
 }
 
-/// Helper function to handle struct fields
+/// Helper function to generate struct field symbols
 #[allow(deprecated)]
-fn handle_struct_fields(
-    struct_def: StructDef,
-    fields: &mut Vec<DocumentSymbol>,
-    symbols: &Symbols,
-) {
-    let cloned_fileds = struct_def.field_defs;
+fn struct_field_symbols(struct_def: &MemberDef, symbols: &Symbols) -> Vec<DocumentSymbol> {
+    let mut fields: Vec<DocumentSymbol> = vec![];
+    if let MemberDefInfo::Struct {
+        field_defs,
+        positional: _,
+    } = &struct_def.info
+    {
+        for field_def in field_defs {
+            let Some(field_range) = symbols.files.lsp_range_opt(&field_def.loc) else {
+                continue;
+            };
 
-    for field_def in cloned_fileds {
-        let Some(field_range) = symbols.files.lsp_range_opt(&field_def.loc) else {
-            continue;
-        };
-
-        fields.push(DocumentSymbol {
-            name: field_def.name.clone().to_string(),
-            detail: None,
-            kind: SymbolKind::FIELD,
-            range: field_range,
-            selection_range: field_range,
-            children: None,
-            tags: Some(vec![]),
-            deprecated: Some(false),
-        });
+            fields.push(DocumentSymbol {
+                name: field_def.name.clone().to_string(),
+                detail: None,
+                kind: SymbolKind::FIELD,
+                range: field_range,
+                selection_range: field_range,
+                children: None,
+                tags: Some(vec![]),
+                deprecated: Some(false),
+            });
+        }
     }
+    fields
+}
+
+/// Helper function to generate enum variant symbols
+#[allow(deprecated)]
+fn enum_variant_symbols(enum_def: &MemberDef, symbols: &Symbols) -> Vec<DocumentSymbol> {
+    let mut variants: Vec<DocumentSymbol> = vec![];
+    if let MemberDefInfo::Enum { variants_info } = &enum_def.info {
+        for (name, (loc, _, _)) in variants_info {
+            let Some(variant_range) = symbols.files.lsp_range_opt(loc) else {
+                continue;
+            };
+
+            variants.push(DocumentSymbol {
+                name: name.clone().to_string(),
+                detail: None,
+                kind: SymbolKind::ENUM_MEMBER,
+                range: variant_range,
+                selection_range: variant_range,
+                children: None,
+                tags: Some(vec![]),
+                deprecated: Some(false),
+            });
+        }
+    }
+    variants
 }

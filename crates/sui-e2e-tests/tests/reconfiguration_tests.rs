@@ -23,7 +23,7 @@ use sui_types::sui_system_state::{
     get_validator_from_table, sui_system_state_summary::get_validator_by_pool_id,
     SuiSystemStateTrait,
 };
-use sui_types::transaction::{TransactionDataAPI, TransactionExpiration};
+use sui_types::transaction::{TransactionDataAPI, TransactionExpiration, VerifiedTransaction};
 use test_cluster::{TestCluster, TestClusterBuilder};
 use tokio::time::sleep;
 
@@ -297,7 +297,7 @@ async fn do_test_passive_reconfig() {
         });
 }
 
-// Test for syncing a node to an authority that already has many txes.
+// Test that transaction locks from previously epochs could be overridden.
 #[sim_test]
 async fn test_expired_locks() {
     let test_cluster = TestClusterBuilder::new()
@@ -324,13 +324,24 @@ async fn test_expired_locks() {
     };
 
     let t1 = transfer_sui(1);
+    // attempt to equivocate
+    let t2 = transfer_sui(2);
+
+    for (idx, validator) in test_cluster.all_validator_handles().into_iter().enumerate() {
+        let state = validator.state();
+        let epoch_store = state.epoch_store_for_testing();
+        let t = if idx % 2 == 0 { t1.clone() } else { t2.clone() };
+        validator
+            .state()
+            .handle_transaction(&epoch_store, VerifiedTransaction::new_unchecked(t))
+            .await
+            .unwrap();
+    }
     test_cluster
         .create_certificate(t1.clone(), None)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    // attempt to equivocate
-    let t2 = transfer_sui(2);
     test_cluster
         .create_certificate(t2.clone(), None)
         .await
@@ -572,7 +583,7 @@ async fn test_inactive_validator_pool_read() {
         assert_eq!(
             system_state
                 .get_current_epoch_committee()
-                .committee
+                .committee()
                 .num_members(),
             4
         );
@@ -713,8 +724,6 @@ async fn do_test_reconfig_with_committee_change_stress() {
 #[cfg(msim)]
 #[sim_test]
 async fn test_epoch_flag_upgrade() {
-    use std::any;
-
     use std::sync::Mutex;
     use sui_core::authority::epoch_start_configuration::EpochFlag;
     use sui_core::authority::epoch_start_configuration::EpochStartConfigTrait;

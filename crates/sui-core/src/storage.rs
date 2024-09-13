@@ -24,8 +24,9 @@ use sui_types::storage::error::Error as StorageError;
 use sui_types::storage::error::Result;
 use sui_types::storage::AccountOwnedObjectInfo;
 use sui_types::storage::CoinInfo;
+use sui_types::storage::DynamicFieldIndexInfo;
+use sui_types::storage::DynamicFieldKey;
 use sui_types::storage::ObjectStore;
-use sui_types::storage::RestDynamicFieldInfo;
 use sui_types::storage::RestStateReader;
 use sui_types::storage::WriteStore;
 use sui_types::storage::{ObjectKey, ReadStore};
@@ -37,8 +38,6 @@ use crate::checkpoints::CheckpointStore;
 use crate::epoch::committee_store::CommitteeStore;
 use crate::execution_cache::ExecutionCacheTraitPointers;
 use crate::rest_index::CoinIndexInfo;
-use crate::rest_index::DynamicFieldIndexInfo;
-use crate::rest_index::DynamicFieldKey;
 use crate::rest_index::OwnerIndexInfo;
 use crate::rest_index::OwnerIndexKey;
 use crate::rest_index::RestIndexStore;
@@ -120,10 +119,16 @@ impl ReadStore for RocksDbStore {
     }
 
     fn get_lowest_available_checkpoint(&self) -> Result<CheckpointSequenceNumber, StorageError> {
-        self.checkpoint_store
+        let highest_pruned_cp = self
+            .checkpoint_store
             .get_highest_pruned_checkpoint_seq_number()
-            .map(|seq| seq + 1)
-            .map_err(Into::into)
+            .map_err(Into::<StorageError>::into)?;
+
+        if highest_pruned_cp == 0 {
+            Ok(0)
+        } else {
+            Ok(highest_pruned_cp + 1)
+        }
     }
 
     fn get_full_checkpoint_contents_by_sequence_number(
@@ -234,7 +239,8 @@ impl ReadStore for RocksDbStore {
 
     fn get_latest_checkpoint(&self) -> sui_types::storage::error::Result<VerifiedCheckpoint> {
         self.checkpoint_store
-            .get_latest_certified_checkpoint()
+            .get_highest_executed_checkpoint()
+            .map_err(sui_types::storage::error::Error::custom)?
             .ok_or_else(|| {
                 sui_types::storage::error::Error::missing("unable to get latest checkpoint")
             })
@@ -508,11 +514,17 @@ impl RestStateReader for RestReadStore {
     fn get_lowest_available_checkpoint_objects(
         &self,
     ) -> sui_types::storage::error::Result<CheckpointSequenceNumber> {
-        self.state
+        let highest_pruned_cp = self
+            .state
             .get_object_cache_reader()
             .get_highest_pruned_checkpoint()
-            .map(|seq| seq + 1)
-            .map_err(StorageError::custom)
+            .map_err(StorageError::custom)?;
+
+        if highest_pruned_cp == 0 {
+            Ok(0)
+        } else {
+            Ok(highest_pruned_cp + 1)
+        }
     }
 
     fn get_chain_identifier(
@@ -546,28 +558,10 @@ impl RestStateReader for RestReadStore {
         &self,
         parent: ObjectID,
         cursor: Option<ObjectID>,
-    ) -> sui_types::storage::error::Result<Box<dyn Iterator<Item = RestDynamicFieldInfo> + '_>>
-    {
-        let iter = self.index()?.dynamic_field_iter(parent, cursor)?.map(
-            |(
-                DynamicFieldKey { parent, field_id },
-                DynamicFieldIndexInfo {
-                    dynamic_field_type,
-                    name_type,
-                    name_value,
-                    dynamic_object_id,
-                },
-            )| {
-                RestDynamicFieldInfo {
-                    parent,
-                    field_id,
-                    dynamic_field_type,
-                    name_type,
-                    name_value,
-                    dynamic_object_id,
-                }
-            },
-        );
+    ) -> sui_types::storage::error::Result<
+        Box<dyn Iterator<Item = (DynamicFieldKey, DynamicFieldIndexInfo)> + '_>,
+    > {
+        let iter = self.index()?.dynamic_field_iter(parent, cursor)?;
 
         Ok(Box::new(iter) as _)
     }

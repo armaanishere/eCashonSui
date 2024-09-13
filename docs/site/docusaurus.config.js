@@ -65,7 +65,7 @@ const config = {
       "@graphql-markdown/docusaurus",
       {
         schema:
-          "../../crates/sui-graphql-rpc/schema/current_progress_schema.graphql",
+          "../../crates/sui-graphql-rpc/schema.graphql",
         rootPath: "../content", // docs will be generated under rootPath/baseURL
         baseURL: "references/sui-api/sui-graphql/reference",
         loaders: {
@@ -92,6 +92,7 @@ const config = {
     },
     path.resolve(__dirname, `./src/plugins/descriptions`),
     path.resolve(__dirname, `./src/plugins/framework`),
+    path.resolve(__dirname, `./src/plugins/askcookbook`),
   ],
   presets: [
     [

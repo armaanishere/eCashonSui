@@ -49,11 +49,7 @@ use crate::transaction_outputs::TransactionOutputs;
 
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::DashMap;
-use either::Either;
-use futures::{
-    future::{join_all, BoxFuture},
-    FutureExt,
-};
+use futures::{future::BoxFuture, FutureExt};
 use moka::sync::Cache as MokaCache;
 use mysten_common::sync::notify_read::NotifyRead;
 use parking_lot::Mutex;
@@ -77,6 +73,7 @@ use sui_types::object::Object;
 use sui_types::storage::{MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore, PackageObject};
 use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState};
 use sui_types::transaction::{VerifiedSignedTransaction, VerifiedTransaction};
+use tap::TapOptional;
 use tracing::{debug, info, instrument, trace, warn};
 
 use super::ExecutionCacheAPI;
@@ -808,6 +805,11 @@ impl WritebackCache {
         let tx_digest = *transaction.digest();
         let effects_digest = effects.digest();
 
+        self.metrics.record_cache_write("transaction_block");
+        self.dirty
+            .pending_transaction_writes
+            .insert(tx_digest, tx_outputs.clone());
+
         // insert transaction effects before executed_effects_digests so that there
         // are never dangling entries in executed_effects_digests
         self.metrics.record_cache_write("transaction_effects");
@@ -834,11 +836,6 @@ impl WritebackCache {
         self.dirty
             .executed_effects_digests
             .insert(tx_digest, effects_digest);
-
-        self.metrics.record_cache_write("transaction_block");
-        self.dirty
-            .pending_transaction_writes
-            .insert(tx_digest, tx_outputs);
 
         self.executed_effects_digests_notify_read
             .notify(&tx_digest, &effects_digest);
@@ -1457,7 +1454,10 @@ impl ObjectCacheRead for WritebackCache {
                 // exists only to ensure correctness in all the edge cases.
                 let latest: Option<(SequenceNumber, ObjectEntry)> =
                     if let Some(dirty_set) = dirty_entry {
-                        dirty_set.get_highest().cloned()
+                        dirty_set
+                            .get_highest()
+                            .cloned()
+                            .tap_none(|| panic!("dirty set cannot be empty"))
                     } else {
                         self.record_db_get("object_lt_or_eq_version_latest")
                             .get_latest_object_or_tombstone(object_id)?
@@ -1489,7 +1489,12 @@ impl ObjectCacheRead for WritebackCache {
                     }
                 } else {
                     // no object found in dirty set or db, object does not exist
-                    assert!(cached_entry.is_none());
+                    // When this is called from a read api (i.e. not the execution path) it is
+                    // possible that the object has been deleted and pruned. In this case,
+                    // there would be no entry at all on disk, but we may have a tombstone in the
+                    // cache
+                    let highest = cached_entry.and_then(|c| c.get_highest());
+                    assert!(highest.is_none() || highest.unwrap().1.is_tombstone());
                     self.cache_object_not_found(&object_id);
                     Ok(None)
                 }
@@ -1735,25 +1740,11 @@ impl TransactionCacheRead for WritebackCache {
         &'a self,
         digests: &'a [TransactionDigest],
     ) -> BoxFuture<'a, SuiResult<Vec<TransactionEffectsDigest>>> {
-        async move {
-            let registrations = self
-                .executed_effects_digests_notify_read
-                .register_all(digests);
-
-            let executed_effects_digests = self.multi_get_executed_effects_digests(digests)?;
-
-            let results = executed_effects_digests
-                .into_iter()
-                .zip(registrations)
-                .map(|(a, r)| match a {
-                    // Note that Some() clause also drops registration that is already fulfilled
-                    Some(ready) => Either::Left(futures::future::ready(ready)),
-                    None => Either::Right(r),
-                });
-
-            Ok(join_all(results).await)
-        }
-        .boxed()
+        self.executed_effects_digests_notify_read
+            .read(digests, |digests| {
+                self.multi_get_executed_effects_digests(digests)
+            })
+            .boxed()
     }
 
     fn multi_get_events(

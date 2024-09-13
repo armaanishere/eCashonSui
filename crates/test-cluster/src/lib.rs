@@ -5,8 +5,6 @@ use futures::Future;
 use futures::{future::join_all, StreamExt};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use jsonrpsee::ws_client::WsClient;
-use jsonrpsee::ws_client::WsClientBuilder;
 use rand::{distributions::*, rngs::OsRng, seq::SliceRandom};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -23,6 +21,7 @@ use sui_bridge::types::CertifiedBridgeAction;
 use sui_bridge::types::VerifiedCertifiedBridgeAction;
 use sui_bridge::utils::publish_and_register_coins_return_add_coins_on_sui_action;
 use sui_bridge::utils::wait_for_server_to_be_up;
+use sui_config::genesis::Genesis;
 use sui_config::local_ip_utils::get_available_port;
 use sui_config::node::{AuthorityOverloadConfig, DBCheckpointConfig, RunWithRange};
 use sui_config::{Config, SUI_CLIENT_CONFIG, SUI_NETWORK_CONFIG};
@@ -37,7 +36,7 @@ use sui_json_rpc_types::{
 };
 use sui_keys::keystore::{AccountKeystore, FileBasedKeystore, Keystore};
 use sui_node::SuiNodeHandle;
-use sui_protocol_config::{ProtocolVersion, SupportedProtocolVersions};
+use sui_protocol_config::ProtocolVersion;
 use sui_sdk::apis::QuorumDriverApi;
 use sui_sdk::sui_client_config::{SuiClientConfig, SuiEnv};
 use sui_sdk::wallet_context::WalletContext;
@@ -69,6 +68,7 @@ use sui_types::object::Object;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
 use sui_types::sui_system_state::SuiSystemState;
 use sui_types::sui_system_state::SuiSystemStateTrait;
+use sui_types::supported_protocol_versions::SupportedProtocolVersions;
 use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig};
 use sui_types::transaction::{
     CertifiedTransaction, ObjectArg, Transaction, TransactionData, TransactionDataAPI,
@@ -86,7 +86,6 @@ pub struct FullNodeHandle {
     pub sui_client: SuiClient,
     pub rpc_client: HttpClient,
     pub rpc_url: String,
-    pub ws_url: String,
 }
 
 impl FullNodeHandle {
@@ -94,7 +93,6 @@ impl FullNodeHandle {
         let rpc_url = format!("http://{}", json_rpc_address);
         let rpc_client = HttpClientBuilder::default().build(&rpc_url).unwrap();
 
-        let ws_url = format!("ws://{}", json_rpc_address);
         let sui_client = SuiClientBuilder::default().build(&rpc_url).await.unwrap();
 
         Self {
@@ -102,15 +100,7 @@ impl FullNodeHandle {
             sui_client,
             rpc_client,
             rpc_url,
-            ws_url,
         }
-    }
-
-    pub async fn ws_client(&self) -> WsClient {
-        WsClientBuilder::default()
-            .build(&self.ws_url)
-            .await
-            .unwrap()
     }
 }
 
@@ -208,6 +198,10 @@ impl TestCluster {
 
     pub fn get_validator_pubkeys(&self) -> Vec<AuthorityName> {
         self.swarm.active_validators().map(|v| v.name()).collect()
+    }
+
+    pub fn get_genesis(&self) -> Genesis {
+        self.swarm.config().genesis.clone()
     }
 
     pub fn stop_node(&self, name: &AuthorityName) {
@@ -1197,6 +1191,10 @@ impl TestClusterBuilder {
 
     pub async fn build_with_bridge(
         self,
+        // Note: caller should make sure to keep the authority with largest stake at the end of the list.
+        // This is because we try to set up eth env and sui cluster at the same time. Since we use evenly
+        // distributed stake, we want to keep the authority with the remainder consistent in eth contracts
+        // and sui cluster.
         bridge_authority_keys: Vec<BridgeAuthorityKeyPair>,
         deploy_tokens: bool,
     ) -> TestCluster {
@@ -1227,11 +1225,32 @@ impl TestClusterBuilder {
         let mut server_ports = vec![];
         let mut tasks = vec![];
         let quorum_driver_api = test_cluster.quorum_driver_api().clone();
-        for (node, kp) in test_cluster
+        // Reorder the nodes so that the last node has the largest stake.
+        let validator_with_max_stake = test_cluster
+            .sui_client()
+            .governance_api()
+            .get_committee_info(None)
+            .await
+            .unwrap()
+            .validators
+            .iter()
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .unwrap()
+            .0;
+        let node_with_max_stake = test_cluster
             .swarm
             .active_validators()
-            .zip(bridge_authority_keys.iter())
-        {
+            .find(|v| v.config().protocol_public_key() == validator_with_max_stake)
+            .unwrap();
+        let other_nodes = test_cluster
+            .swarm
+            .active_validators()
+            .filter(|v| v.config().protocol_public_key() != validator_with_max_stake)
+            .collect::<Vec<_>>();
+        let reordered_nodes = other_nodes
+            .iter()
+            .chain(std::iter::once(&node_with_max_stake));
+        for (node, kp) in reordered_nodes.zip(bridge_authority_keys.iter()) {
             let validator_address = node.config().sui_address();
             // create committee registration tx
             let gas = test_cluster
