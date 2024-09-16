@@ -141,7 +141,6 @@ const addCodeInject = function (source) {
                 for (let struct of structs) {
                   struct = struct.trim();
                   const structStr = `^(\\s*)*?(pub(lic)? )?struct \\b${struct}\\b.*?}`;
-                  const structStr = `^(\\s*)*?(pub(lic)? )?struct \\b${struct}\\b.*?}`;
                   const structRE = new RegExp(structStr, "msi");
                   const structMatch = structRE.exec(injectFileContent);
                   if (structMatch) {
@@ -234,8 +233,9 @@ const addCodeInject = function (source) {
                 let useContent = [];
                 for (let u of us) {
                   u = u.trim();
-                  const useStr = `^( *)(#\\[test_only\\] )?use ${u}.*?;`;
-                  const useRE = new RegExp(useStr, "mg");
+                  const uArray = u.split("::");
+                  const useStr = `^( *)(#\\[test_only\\] )?use ${uArray[0]}::\\{?.*?${uArray[1] ? uArray[1] : ""}.*?\\};`;
+                  const useRE = new RegExp(useStr, "ms");
                   const useMatch = useRE.exec(injectFileContent);
                   if (useMatch) {
                     let preUse = utils.capturePrepend(
@@ -251,10 +251,7 @@ const addCodeInject = function (source) {
                   }
                 }
 
-                injectFileContent = useContent
-                  .map((l) => l.replace(/\n/g, ""))
-                  .join("\n")
-                  .trim();
+                injectFileContent = useContent.join("\n").trim();
               } else if (componentName) {
                 const components = componentName.split(",");
                 let componentContent = [];

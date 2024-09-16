@@ -64,8 +64,7 @@ const config = {
     [
       "@graphql-markdown/docusaurus",
       {
-        schema:
-          "../../crates/sui-graphql-rpc/schema.graphql",
+        schema: "../../crates/sui-graphql-rpc/schema.graphql",
         rootPath: "../content", // docs will be generated under rootPath/baseURL
         baseURL: "references/sui-api/sui-graphql/reference",
         loaders: {
@@ -117,6 +116,10 @@ const config = {
             "current",
             "1.0.0",
           ],*/
+          admonitions: {
+            keywords: ["checkpoint"],
+            extendDefaults: true,
+          },
           remarkPlugins: [
             math,
             [
