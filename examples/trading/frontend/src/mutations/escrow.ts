@@ -6,9 +6,10 @@ import { useTransactionExecution } from "@/hooks/useTransactionExecution";
 import { ApiEscrowObject, ApiLockedObject } from "@/types/types";
 import { useCurrentAccount, useSuiClient } from "@mysten/dapp-kit";
 import { SuiObjectData } from "@mysten/sui/client";
-import { TransactionBlock } from "@mysten/sui/transactions";
+import { Transaction } from "@mysten/sui/transactions";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
+//docs::#mutationacceptescrow
 /**
  * Builds and executes the PTB to accept an escrow.
  */
@@ -28,7 +29,7 @@ export function useAcceptEscrowMutation() {
     }) => {
       if (!currentAccount?.address)
         throw new Error("You need to connect your wallet!");
-      const txb = new TransactionBlock();
+      const txb = new Transaction();
 
       const escrowObject = await client.multiGetObjects({
         ids: [escrow.itemId, locked.itemId],
@@ -71,7 +72,9 @@ export function useAcceptEscrowMutation() {
     },
   });
 }
+//docs::/#mutationacceptescrow
 
+//docs::#mutationcancelescrow
 /**
  * Builds and executes the PTB to cancel an escrow.
  */
@@ -90,7 +93,7 @@ export function useCancelEscrowMutation() {
     }) => {
       if (!currentAccount?.address)
         throw new Error("You need to connect your wallet!");
-      const txb = new TransactionBlock();
+      const txb = new Transaction();
 
       const item = txb.moveCall({
         target: `${CONSTANTS.escrowContract.packageId}::shared::return_to_sender`,
@@ -110,7 +113,9 @@ export function useCancelEscrowMutation() {
     },
   });
 }
+//docs::/#mutationcancelescrow
 
+//docs::#mutationcreateescrow
 /**
  * Builds and executes the PTB to create an escrow.
  */
@@ -129,7 +134,7 @@ export function useCreateEscrowMutation() {
       if (!currentAccount?.address)
         throw new Error("You need to connect your wallet!");
 
-      const txb = new TransactionBlock();
+      const txb = new Transaction();
       txb.moveCall({
         target: `${CONSTANTS.escrowContract.packageId}::shared::create`,
         arguments: [
@@ -144,3 +149,4 @@ export function useCreateEscrowMutation() {
     },
   });
 }
+//docs::/#mutationcreateescrow

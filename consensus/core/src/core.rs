@@ -83,6 +83,10 @@ pub(crate) struct Core {
     block_signer: ProtocolKeyPair,
     /// Keeping track of state of the DAG, including blocks, commits and last committed rounds.
     dag_state: Arc<RwLock<DagState>>,
+    /// The last known round for which the node has proposed. Any proposal should be for a round > of this.
+    /// This is currently being used to avoid equivocations during a node recovering from amnesia. When value is None it means that
+    /// the last block sync mechanism is enabled, but it hasn't been initialised yet.
+    last_known_proposed_round: Option<Round>,
 }
 
 impl Core {
@@ -96,6 +100,7 @@ impl Core {
         signals: CoreSignals,
         block_signer: ProtocolKeyPair,
         dag_state: Arc<RwLock<DagState>>,
+        sync_last_known_own_block: bool,
     ) -> Self {
         let last_decided_leader = dag_state.read().last_commit_leader();
         let number_of_leaders = context
@@ -129,6 +134,13 @@ impl Core {
             last_included_ancestors[ancestor.author] = Some(*ancestor);
         }
 
+        let min_propose_round = if sync_last_known_own_block {
+            None
+        } else {
+            // if the sync is disabled then we practically don't want to impose any restriction.
+            Some(0)
+        };
+
         Self {
             context: context.clone(),
             threshold_clock: ThresholdClock::new(0, context.clone()),
@@ -144,6 +156,7 @@ impl Core {
             signals,
             block_signer,
             dag_state,
+            last_known_proposed_round: min_propose_round,
         }
         .recover()
     }
@@ -191,6 +204,11 @@ impl Core {
                 .new_block(self.last_proposed_block.clone())
                 .unwrap();
         }
+
+        info!(
+            "Core recovery completed with last proposed block {:?}",
+            self.last_proposed_block
+        );
 
         self
     }
@@ -284,6 +302,17 @@ impl Core {
         Ok(None)
     }
 
+    /// Sets the min propose round for the proposer allowing to propose blocks only for round numbers
+    /// `> last_known_proposed_round`. At the moment is allowed to call the method only once leading to a panic
+    /// if attempt to do multiple times.
+    pub(crate) fn set_last_known_proposed_round(&mut self, round: Round) {
+        if self.last_known_proposed_round.is_some() {
+            panic!("Should not attempt to set the last known proposed round if that has been already set");
+        }
+        self.last_known_proposed_round = Some(round);
+        info!("Set last known proposed round to {round}");
+    }
+
     // Attempts to create a new block, persist and propose it to all peers.
     // When force is true, ignore if leader from the last round exists among ancestors and if
     // the minimum round delay has passed.
@@ -355,7 +384,6 @@ impl Core {
                     .saturating_duration_since(self.threshold_clock.get_quorum_ts())
                     .as_millis() as u64,
             );
-
         self.context
             .metrics
             .node_metrics
@@ -374,8 +402,17 @@ impl Core {
         self.context
             .metrics
             .node_metrics
-            .block_ancestors
+            .proposed_block_ancestors
             .observe(ancestors.len() as f64);
+        for ancestor in &ancestors {
+            let authority = &self.context.committee.authority(ancestor.author()).hostname;
+            self.context
+                .metrics
+                .node_metrics
+                .proposed_block_ancestors_depth
+                .with_label_values(&[authority])
+                .observe(clock_round.saturating_sub(ancestor.round()).into());
+        }
 
         // Ensure ancestor timestamps are not more advanced than the current time.
         // Also catch the issue if system's clock go backwards.
@@ -391,6 +428,11 @@ impl Core {
         // Consume the next transactions to be included. Do not drop the guards yet as this would acknowledge
         // the inclusion of transactions. Just let this be done in the end of the method.
         let (transactions, ack_transactions) = self.transaction_consumer.next();
+        self.context
+            .metrics
+            .node_metrics
+            .proposed_block_transactions
+            .observe(transactions.len() as f64);
 
         // Consume the commit votes to be included.
         let commit_votes = self
@@ -417,7 +459,7 @@ impl Core {
         self.context
             .metrics
             .node_metrics
-            .block_size
+            .proposed_block_size
             .observe(serialized.len() as f64);
         // Unnecessary to verify own blocks.
         let verified_block = VerifiedBlock::new_verified(signed_block, serialized);
@@ -508,7 +550,17 @@ impl Core {
                     tracing::info!(
                         "Leader schedule change triggered at commit index {last_commit_index}"
                     );
-                    self.leader_schedule.update_leader_schedule(&self.dag_state);
+                    if self
+                        .context
+                        .protocol_config
+                        .consensus_distributed_vote_scoring_strategy()
+                    {
+                        self.leader_schedule
+                            .update_leader_schedule_v2(&self.dag_state);
+                    } else {
+                        self.leader_schedule
+                            .update_leader_schedule_v1(&self.dag_state);
+                    }
                     commits_until_update = self
                         .leader_schedule
                         .commits_until_leader_schedule_update(self.dag_state.clone());
@@ -562,9 +614,18 @@ impl Core {
 
                 // TODO: refcount subdags
                 let subdags = self.commit_observer.handle_commit(sequenced_leaders)?;
-                self.dag_state
-                    .write()
-                    .add_unscored_committed_subdags(subdags.clone());
+                if self
+                    .context
+                    .protocol_config
+                    .consensus_distributed_vote_scoring_strategy()
+                {
+                    self.dag_state.write().add_scoring_subdags(subdags.clone());
+                } else {
+                    // TODO: Remove when DistributedVoteScoring is enabled.
+                    self.dag_state
+                        .write()
+                        .add_unscored_committed_subdags(subdags.clone());
+                }
                 committed_subdags.extend(subdags);
             }
 
@@ -585,7 +646,21 @@ impl Core {
 
     /// Whether the core should propose new blocks.
     fn should_propose(&self) -> bool {
-        self.consumer_availability
+        let clock_round = self.threshold_clock.get_round();
+        let skip_proposing = if let Some(last_known_proposed_round) = self.last_known_proposed_round
+        {
+            if clock_round <= last_known_proposed_round {
+                debug!("Skip proposing for round {clock_round} as last known proposed round is {last_known_proposed_round}");
+                true
+            } else {
+                false
+            }
+        } else {
+            debug!("Skip proposing for round {clock_round}, last known proposed round has not been synced yet.");
+            true
+        };
+
+        self.consumer_availability && !skip_proposing
     }
 
     /// Retrieves the next ancestors to propose to form a block at `clock_round` round.
@@ -717,6 +792,11 @@ impl CoreSignals {
         // When there is only one authority in committee, it is unnecessary to broadcast
         // the block which will fail anyway without subscribers to the signal.
         if self.context.committee.size() > 1 {
+            if block.round() == GENESIS_ROUND {
+                debug!("Ignoring broadcasting genesis block to peers");
+                return Ok(());
+            }
+
             if let Err(err) = self.tx_block_broadcast.send(block) {
                 warn!("Couldn't broadcast the block to any receiver: {err}");
                 return Err(ConsensusError::Shutdown);
@@ -801,7 +881,7 @@ impl CoreTextFixture {
                 .with_num_commits_per_schedule(10),
         );
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
-        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
         let (signals, signal_receivers) = CoreSignals::new(context.clone());
         // Need at least one subscriber to the block broadcast channel.
         let block_receiver = signal_receivers.block_broadcast_receiver();
@@ -809,7 +889,7 @@ impl CoreTextFixture {
         let (commit_sender, commit_receiver) = unbounded_channel("consensus_output");
         let commit_observer = CommitObserver::new(
             context.clone(),
-            CommitConsumer::new(commit_sender.clone(), 0, 0),
+            CommitConsumer::new(commit_sender.clone(), 0),
             dag_state.clone(),
             store.clone(),
             leader_schedule.clone(),
@@ -827,6 +907,7 @@ impl CoreTextFixture {
             signals,
             block_signer,
             dag_state,
+            false,
         );
 
         Self {
@@ -855,6 +936,7 @@ mod test {
         commit::{CommitAPI as _, CommitRange},
         leader_scoring::ReputationScores,
         storage::{mem_store::MemStore, Store, WriteBatch},
+        test_dag_builder::DagBuilder,
         transaction::TransactionClient,
         CommitConsumer, CommitIndex,
     };
@@ -867,7 +949,7 @@ mod test {
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
-        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
 
         // Create test blocks for all the authorities for 4 rounds and populate them in store
         let mut last_round_blocks = genesis_blocks(context.clone());
@@ -906,7 +988,7 @@ mod test {
         let (sender, _receiver) = unbounded_channel("consensus_output");
         let commit_observer = CommitObserver::new(
             context.clone(),
-            CommitConsumer::new(sender.clone(), 0, 0),
+            CommitConsumer::new(sender.clone(), 0),
             dag_state.clone(),
             store.clone(),
             leader_schedule.clone(),
@@ -931,6 +1013,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            false,
         );
 
         // New round should be 5
@@ -977,7 +1060,7 @@ mod test {
         let context = Arc::new(context);
         let store = Arc::new(MemStore::new());
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
-        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
 
         // Create test blocks for all authorities except our's (index = 0).
         let mut last_round_blocks = genesis_blocks(context.clone());
@@ -1023,7 +1106,7 @@ mod test {
         let (sender, _receiver) = unbounded_channel("consensus_output");
         let commit_observer = CommitObserver::new(
             context.clone(),
-            CommitConsumer::new(sender.clone(), 0, 0),
+            CommitConsumer::new(sender.clone(), 0),
             dag_state.clone(),
             store.clone(),
             leader_schedule.clone(),
@@ -1048,6 +1131,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            false,
         );
 
         // New round should be 4
@@ -1107,7 +1191,7 @@ mod test {
             Arc::new(NoopBlockVerifier),
         );
         let (transaction_client, tx_receiver) = TransactionClient::new(context.clone());
-        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
         let (signals, signal_receivers) = CoreSignals::new(context.clone());
         // Need at least one subscriber to the block broadcast channel.
         let mut block_receiver = signal_receivers.block_broadcast_receiver();
@@ -1119,7 +1203,7 @@ mod test {
         let (sender, _receiver) = unbounded_channel("consensus_output");
         let commit_observer = CommitObserver::new(
             context.clone(),
-            CommitConsumer::new(sender.clone(), 0, 0),
+            CommitConsumer::new(sender.clone(), 0),
             dag_state.clone(),
             store.clone(),
             leader_schedule.clone(),
@@ -1135,6 +1219,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            false,
         );
 
         // Send some transactions
@@ -1173,12 +1258,7 @@ mod test {
             let transaction: String = bcs::from_bytes(transaction.data()).unwrap();
             assert_eq!(format!("Transaction {i}"), transaction);
         }
-        assert!(
-            total
-                <= context
-                    .protocol_config
-                    .consensus_max_transactions_in_block_bytes()
-        );
+        assert!(total <= context.protocol_config.max_transactions_in_block_bytes());
 
         // genesis blocks should be referenced
         let all_genesis = genesis_blocks(context);
@@ -1220,7 +1300,7 @@ mod test {
         ));
 
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
-        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
         let (signals, signal_receivers) = CoreSignals::new(context.clone());
         // Need at least one subscriber to the block broadcast channel.
         let _block_receiver = signal_receivers.block_broadcast_receiver();
@@ -1228,7 +1308,7 @@ mod test {
         let (sender, _receiver) = unbounded_channel("consensus_output");
         let commit_observer = CommitObserver::new(
             context.clone(),
-            CommitConsumer::new(sender.clone(), 0, 0),
+            CommitConsumer::new(sender.clone(), 0),
             dag_state.clone(),
             store.clone(),
             leader_schedule.clone(),
@@ -1244,6 +1324,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            false,
         );
 
         let mut expected_ancestors = BTreeSet::new();
@@ -1283,6 +1364,94 @@ mod test {
         let last_commit = store.read_last_commit().unwrap();
         assert!(last_commit.is_none());
         assert_eq!(dag_state.read().last_commit_index(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_core_set_min_propose_round() {
+        telemetry_subscribers::init_for_testing();
+        let (context, mut key_pairs) = Context::new_for_test(4);
+        let context = Arc::new(context.with_parameters(Parameters {
+            sync_last_known_own_block_timeout: Duration::from_millis(2_000),
+            ..Default::default()
+        }));
+
+        let store = Arc::new(MemStore::new());
+        let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
+
+        let block_manager = BlockManager::new(
+            context.clone(),
+            dag_state.clone(),
+            Arc::new(NoopBlockVerifier),
+        );
+        let leader_schedule = Arc::new(LeaderSchedule::from_store(
+            context.clone(),
+            dag_state.clone(),
+        ));
+
+        let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
+        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
+        let (signals, signal_receivers) = CoreSignals::new(context.clone());
+        // Need at least one subscriber to the block broadcast channel.
+        let _block_receiver = signal_receivers.block_broadcast_receiver();
+
+        let (sender, _receiver) = unbounded_channel("consensus_output");
+        let commit_observer = CommitObserver::new(
+            context.clone(),
+            CommitConsumer::new(sender.clone(), 0),
+            dag_state.clone(),
+            store.clone(),
+            leader_schedule.clone(),
+        );
+
+        let mut core = Core::new(
+            context.clone(),
+            leader_schedule,
+            transaction_consumer,
+            block_manager,
+            true,
+            commit_observer,
+            signals,
+            key_pairs.remove(context.own_index.value()).1,
+            dag_state.clone(),
+            true,
+        );
+
+        // No new block should have been produced
+        assert_eq!(
+            core.last_proposed_round(),
+            GENESIS_ROUND,
+            "No block should have been created other than genesis"
+        );
+
+        // Trying to explicitly propose a block will not produce anything
+        assert!(core.try_propose(true).unwrap().is_none());
+
+        // Create blocks for the whole network - even "our" node in order to replicate an "amnesia" recovery.
+        let mut builder = DagBuilder::new(context.clone());
+        builder.layers(1..=10).build();
+
+        let blocks = builder.blocks.values().cloned().collect::<Vec<_>>();
+
+        // Process all the blocks
+        assert!(core.add_blocks(blocks).unwrap().is_empty());
+
+        // Try to propose - no block should be produced.
+        assert!(core.try_propose(true).unwrap().is_none());
+
+        // Now set the last known proposed round which is the highest round for which the network informed
+        // us that we do have proposed a block about.
+        core.set_last_known_proposed_round(10);
+
+        let block = core.try_propose(true).expect("No error").unwrap();
+        assert_eq!(block.round(), 11);
+        assert_eq!(block.ancestors().len(), 4);
+
+        // Our last ancestored included should be genesis. We do not update the last proposed block via the
+        // normal block processing path to keep it simple.
+        let our_ancestor_included = block.ancestors().iter().find(|block_ref: &&BlockRef| {
+            block_ref.author == context.own_index && block_ref.round == GENESIS_ROUND
+        });
+        assert!(our_ancestor_included.is_some());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1408,7 +1577,7 @@ mod test {
         ));
 
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
-        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
         let (signals, signal_receivers) = CoreSignals::new(context.clone());
         // Need at least one subscriber to the block broadcast channel.
         let _block_receiver = signal_receivers.block_broadcast_receiver();
@@ -1416,7 +1585,7 @@ mod test {
         let (sender, _receiver) = unbounded_channel("consensus_output");
         let commit_observer = CommitObserver::new(
             context.clone(),
-            CommitConsumer::new(sender.clone(), 0, 0),
+            CommitConsumer::new(sender.clone(), 0),
             dag_state.clone(),
             store.clone(),
             leader_schedule.clone(),
@@ -1432,6 +1601,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
+            false,
         );
 
         // No proposal during recovery.
@@ -1457,6 +1627,131 @@ mod test {
         let default_params = Parameters::default();
 
         let (context, _) = Context::new_for_test(4);
+        // create the cores and their signals for all the authorities
+        let mut cores = create_cores(context, vec![1, 1, 1, 1]);
+
+        // Now iterate over a few rounds and ensure the corresponding signals are created while network advances
+        let mut last_round_blocks = Vec::new();
+        for round in 1..=30 {
+            let mut this_round_blocks = Vec::new();
+
+            // Wait for min round delay to allow blocks to be proposed.
+            sleep(default_params.min_round_delay).await;
+
+            for core_fixture in &mut cores {
+                // add the blocks from last round
+                // this will trigger a block creation for the round and a signal should be emitted
+                core_fixture
+                    .core
+                    .add_blocks(last_round_blocks.clone())
+                    .unwrap();
+
+                // A "new round" signal should be received given that all the blocks of previous round have been processed
+                let new_round = receive(
+                    Duration::from_secs(1),
+                    core_fixture.signal_receivers.new_round_receiver(),
+                )
+                .await;
+                assert_eq!(new_round, round);
+
+                // Check that a new block has been proposed.
+                let block = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    core_fixture.block_receiver.recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(block.round(), round);
+                assert_eq!(block.author(), core_fixture.core.context.own_index);
+
+                // append the new block to this round blocks
+                this_round_blocks.push(core_fixture.core.last_proposed_block().clone());
+
+                let block = core_fixture.core.last_proposed_block();
+
+                // ensure that produced block is referring to the blocks of last_round
+                assert_eq!(
+                    block.ancestors().len(),
+                    core_fixture.core.context.committee.size()
+                );
+                for ancestor in block.ancestors() {
+                    if block.round() > 1 {
+                        // don't bother with round 1 block which just contains the genesis blocks.
+                        assert!(
+                            last_round_blocks
+                                .iter()
+                                .any(|block| block.reference() == *ancestor),
+                            "Reference from previous round should be added"
+                        );
+                    }
+                }
+            }
+
+            last_round_blocks = this_round_blocks;
+        }
+
+        for core_fixture in cores {
+            // Check commits have been persisted to store
+            let last_commit = core_fixture
+                .store
+                .read_last_commit()
+                .unwrap()
+                .expect("last commit should be set");
+            // There are 28 leader rounds with rounds completed up to and including
+            // round 29. Round 30 blocks will only include their own blocks, so the
+            // 28th leader will not be committed.
+            assert_eq!(last_commit.index(), 27);
+            let all_stored_commits = core_fixture
+                .store
+                .scan_commits((0..=CommitIndex::MAX).into())
+                .unwrap();
+            assert_eq!(all_stored_commits.len(), 27);
+            assert_eq!(
+                core_fixture
+                    .core
+                    .leader_schedule
+                    .leader_swap_table
+                    .read()
+                    .bad_nodes
+                    .len(),
+                1
+            );
+            assert_eq!(
+                core_fixture
+                    .core
+                    .leader_schedule
+                    .leader_swap_table
+                    .read()
+                    .good_nodes
+                    .len(),
+                1
+            );
+            let expected_reputation_scores =
+                ReputationScores::new((11..=20).into(), vec![29, 29, 29, 29]);
+            assert_eq!(
+                core_fixture
+                    .core
+                    .leader_schedule
+                    .leader_swap_table
+                    .read()
+                    .reputation_scores,
+                expected_reputation_scores
+            );
+        }
+    }
+
+    // TODO: Remove this when DistributedVoteScoring is enabled.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_leader_schedule_change_with_vote_scoring() {
+        telemetry_subscribers::init_for_testing();
+        let default_params = Parameters::default();
+
+        let (mut context, _) = Context::new_for_test(4);
+        context
+            .protocol_config
+            .set_consensus_distributed_vote_scoring_strategy_for_testing(false);
+
         // create the cores and their signals for all the authorities
         let mut cores = create_cores(context, vec![1, 1, 1, 1]);
 
@@ -1717,6 +2012,158 @@ mod test {
 
         // Now iterate over a few rounds and ensure the corresponding signals are created while network advances
         let mut last_round_blocks = Vec::new();
+        for round in 1..=33 {
+            let mut this_round_blocks = Vec::new();
+
+            // Wait for min round delay to allow blocks to be proposed.
+            sleep(default_params.min_round_delay).await;
+
+            for core_fixture in &mut cores {
+                // add the blocks from last round
+                // this will trigger a block creation for the round and a signal should be emitted
+                core_fixture
+                    .core
+                    .add_blocks(last_round_blocks.clone())
+                    .unwrap();
+
+                // A "new round" signal should be received given that all the blocks of previous round have been processed
+                let new_round = receive(
+                    Duration::from_secs(1),
+                    core_fixture.signal_receivers.new_round_receiver(),
+                )
+                .await;
+                assert_eq!(new_round, round);
+
+                // Check that a new block has been proposed.
+                let block = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    core_fixture.block_receiver.recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(block.round(), round);
+                assert_eq!(block.author(), core_fixture.core.context.own_index);
+
+                // append the new block to this round blocks
+                this_round_blocks.push(core_fixture.core.last_proposed_block().clone());
+
+                let block = core_fixture.core.last_proposed_block();
+
+                // ensure that produced block is referring to the blocks of last_round
+                assert_eq!(
+                    block.ancestors().len(),
+                    core_fixture.core.context.committee.size()
+                );
+                for ancestor in block.ancestors() {
+                    if block.round() > 1 {
+                        // don't bother with round 1 block which just contains the genesis blocks.
+                        assert!(
+                            last_round_blocks
+                                .iter()
+                                .any(|block| block.reference() == *ancestor),
+                            "Reference from previous round should be added"
+                        );
+                    }
+                }
+            }
+
+            last_round_blocks = this_round_blocks;
+        }
+
+        for core_fixture in cores {
+            // Check commits have been persisted to store
+            let last_commit = core_fixture
+                .store
+                .read_last_commit()
+                .unwrap()
+                .expect("last commit should be set");
+            // There are 31 leader rounds with rounds completed up to and including
+            // round 33. Round 33 blocks will only include their own blocks, so there
+            // should only be 30 commits.
+            // However on a leader schedule change boundary its is possible for a
+            // new leader to get selected for the same round if the leader elected
+            // gets swapped allowing for multiple leaders to be committed at a round.
+            // Meaning with multi leader per round explicitly set to 1 we will have 30,
+            // otherwise 31.
+            // NOTE: We used 31 leader rounds to specifically trigger the scenario
+            // where the leader schedule boundary occurred AND we had a swap to a new
+            // leader for the same round
+            let expected_commit_count = match num_leaders_per_round {
+                Some(1) => 30,
+                _ => 31,
+            };
+            assert_eq!(last_commit.index(), expected_commit_count);
+            let all_stored_commits = core_fixture
+                .store
+                .scan_commits((0..=CommitIndex::MAX).into())
+                .unwrap();
+            assert_eq!(all_stored_commits.len(), expected_commit_count as usize);
+            assert_eq!(
+                core_fixture
+                    .core
+                    .leader_schedule
+                    .leader_swap_table
+                    .read()
+                    .bad_nodes
+                    .len(),
+                1
+            );
+            assert_eq!(
+                core_fixture
+                    .core
+                    .leader_schedule
+                    .leader_swap_table
+                    .read()
+                    .good_nodes
+                    .len(),
+                1
+            );
+            let expected_reputation_scores =
+                ReputationScores::new((21..=30).into(), vec![43, 43, 43, 43, 43, 43]);
+            assert_eq!(
+                core_fixture
+                    .core
+                    .leader_schedule
+                    .leader_swap_table
+                    .read()
+                    .reputation_scores,
+                expected_reputation_scores
+            );
+        }
+    }
+
+    // TODO: Remove two tests below this when DistributedVoteScoring is enabled.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_commit_on_leader_schedule_change_boundary_without_multileader_with_vote_scoring()
+    {
+        parameterized_test_commit_on_leader_schedule_change_boundary_with_vote_scoring(Some(1))
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_commit_on_leader_schedule_change_boundary_with_multileader_with_vote_scoring() {
+        parameterized_test_commit_on_leader_schedule_change_boundary_with_vote_scoring(None).await;
+    }
+
+    async fn parameterized_test_commit_on_leader_schedule_change_boundary_with_vote_scoring(
+        num_leaders_per_round: Option<usize>,
+    ) {
+        telemetry_subscribers::init_for_testing();
+        let default_params = Parameters::default();
+
+        let (mut context, _) = Context::new_for_test(6);
+        context
+            .protocol_config
+            .set_consensus_distributed_vote_scoring_strategy_for_testing(false);
+        context
+            .protocol_config
+            .set_mysticeti_num_leaders_per_round_for_testing(num_leaders_per_round);
+        // create the cores and their signals for all the authorities
+        let mut cores = create_cores(context, vec![1, 1, 1, 1, 1, 1]);
+
+        // Now iterate over a few rounds and ensure the corresponding signals are created while network advances
+        let mut last_round_blocks = Vec::new();
         for round in 1..=63 {
             let mut this_round_blocks = Vec::new();
 
@@ -1789,7 +2236,7 @@ mod test {
             // However on a leader schedule change boundary its is possible for a
             // new leader to get selected for the same round if the leader elected
             // gets swapped allowing for multiple leaders to be committed at a round.
-            // Meaning with multi leader per round explicitly set to 1 we will have 60,
+            // Meaning with multi leader per round explicitly set to 1 we will have 30,
             // otherwise 61.
             // NOTE: We used 61 leader rounds to specifically trigger the scenario
             // where the leader schedule boundary occurred AND we had a swap to a new

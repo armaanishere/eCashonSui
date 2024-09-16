@@ -24,6 +24,7 @@ vectors are growable. This module has many native functions.
 -  [Function `remove`](#0x1_vector_remove)
 -  [Function `insert`](#0x1_vector_insert)
 -  [Function `swap_remove`](#0x1_vector_swap_remove)
+-  [Function `flatten`](#0x1_vector_flatten)
 
 
 <pre><code></code></pre>
@@ -61,7 +62,7 @@ Create an empty vector.
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_empty">empty</a>&lt;Element&gt;(): <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;;
+<pre><code><b>public</b> <b>native</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_empty">empty</a>&lt;Element&gt;(): <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;;
 </code></pre>
 
 
@@ -84,7 +85,7 @@ Return the length of the vector.
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_length">length</a>&lt;Element&gt;(v: &<a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;): <a href="../move-stdlib/u64.md#0x1_u64">u64</a>;
+<pre><code><b>public</b> <b>native</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_length">length</a>&lt;Element&gt;(v: &<a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;): <a href="../move-stdlib/u64.md#0x1_u64">u64</a>;
 </code></pre>
 
 
@@ -108,7 +109,7 @@ Aborts if <code>i</code> is out of bounds.
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_borrow">borrow</a>&lt;Element&gt;(v: &<a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="../move-stdlib/u64.md#0x1_u64">u64</a>): &Element;
+<pre><code><b>public</b> <b>native</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_borrow">borrow</a>&lt;Element&gt;(v: &<a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="../move-stdlib/u64.md#0x1_u64">u64</a>): &Element;
 </code></pre>
 
 
@@ -131,7 +132,7 @@ Add element <code>e</code> to the end of the vector <code>v</code>.
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_push_back">push_back</a>&lt;Element&gt;(v: &<b>mut</b> <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;, e: Element);
+<pre><code><b>public</b> <b>native</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_push_back">push_back</a>&lt;Element&gt;(v: &<b>mut</b> <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;, e: Element);
 </code></pre>
 
 
@@ -155,7 +156,7 @@ Aborts if <code>i</code> is out of bounds.
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_borrow_mut">borrow_mut</a>&lt;Element&gt;(v: &<b>mut</b> <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="../move-stdlib/u64.md#0x1_u64">u64</a>): &<b>mut</b> Element;
+<pre><code><b>public</b> <b>native</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_borrow_mut">borrow_mut</a>&lt;Element&gt;(v: &<b>mut</b> <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="../move-stdlib/u64.md#0x1_u64">u64</a>): &<b>mut</b> Element;
 </code></pre>
 
 
@@ -179,7 +180,7 @@ Aborts if <code>v</code> is empty.
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_pop_back">pop_back</a>&lt;Element&gt;(v: &<b>mut</b> <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;): Element;
+<pre><code><b>public</b> <b>native</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_pop_back">pop_back</a>&lt;Element&gt;(v: &<b>mut</b> <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;): Element;
 </code></pre>
 
 
@@ -203,7 +204,7 @@ Aborts if <code>v</code> is not empty.
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_destroy_empty">destroy_empty</a>&lt;Element&gt;(v: <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;);
+<pre><code><b>public</b> <b>native</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_destroy_empty">destroy_empty</a>&lt;Element&gt;(v: <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;);
 </code></pre>
 
 
@@ -227,7 +228,7 @@ Aborts if <code>i</code> or <code>j</code> is out of bounds.
 <summary>Implementation</summary>
 
 
-<pre><code><b>native</b> <b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_swap">swap</a>&lt;Element&gt;(v: &<b>mut</b> <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="../move-stdlib/u64.md#0x1_u64">u64</a>, j: <a href="../move-stdlib/u64.md#0x1_u64">u64</a>);
+<pre><code><b>public</b> <b>native</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_swap">swap</a>&lt;Element&gt;(v: &<b>mut</b> <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="../move-stdlib/u64.md#0x1_u64">u64</a>, j: <a href="../move-stdlib/u64.md#0x1_u64">u64</a>);
 </code></pre>
 
 
@@ -282,7 +283,7 @@ Reverses the order of the elements in the vector <code>v</code> in place.
     <b>if</b> (len == 0) <b>return</b> ();
 
     <b>let</b> <b>mut</b> front_index = 0;
-    <b>let</b> <b>mut</b> back_index = len -1;
+    <b>let</b> <b>mut</b> back_index = len - 1;
     <b>while</b> (front_index &lt; back_index) {
         v.<a href="../move-stdlib/vector.md#0x1_vector_swap">swap</a>(front_index, back_index);
         front_index = front_index + 1;
@@ -504,6 +505,33 @@ Aborts if <code>i</code> is out of bounds.
     <b>let</b> last_idx = v.<a href="../move-stdlib/vector.md#0x1_vector_length">length</a>() - 1;
     v.<a href="../move-stdlib/vector.md#0x1_vector_swap">swap</a>(i, last_idx);
     v.<a href="../move-stdlib/vector.md#0x1_vector_pop_back">pop_back</a>()
+}
+</code></pre>
+
+
+
+</details>
+
+<a name="0x1_vector_flatten"></a>
+
+## Function `flatten`
+
+Concatenate the vectors of <code>v</code> into a single vector, keeping the order of the elements.
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_flatten">flatten</a>&lt;T&gt;(v: <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;<a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;T&gt;&gt;): <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;T&gt;
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="../move-stdlib/vector.md#0x1_vector_flatten">flatten</a>&lt;T&gt;(v: <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;<a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;T&gt;&gt;): <a href="../move-stdlib/vector.md#0x1_vector">vector</a>&lt;T&gt; {
+    <b>let</b> <b>mut</b> r = <a href="../move-stdlib/vector.md#0x1_vector">vector</a>[];
+    v.do!(|u| r.<a href="../move-stdlib/vector.md#0x1_vector_append">append</a>(u));
+    r
 }
 </code></pre>
 

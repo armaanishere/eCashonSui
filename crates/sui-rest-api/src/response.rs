@@ -3,10 +3,9 @@
 
 use axum::{
     extract::State,
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use reqwest::StatusCode;
 
 use crate::{
     content_type::ContentType,
@@ -20,6 +19,7 @@ use crate::{
 
 pub struct Bcs<T>(pub T);
 
+#[derive(Debug)]
 pub enum ResponseContent<T, J = T> {
     Bcs(T),
     Json(J),
@@ -53,17 +53,17 @@ where
 }
 
 #[axum::async_trait]
-impl<T, S, B> axum::extract::FromRequest<S, B> for Bcs<T>
+impl<T, S> axum::extract::FromRequest<S> for Bcs<T>
 where
     T: serde::de::DeserializeOwned,
     S: Send + Sync,
-    B: axum::body::HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<axum::BoxError>,
 {
     type Rejection = BcsRejection;
 
-    async fn from_request(req: axum::http::Request<B>, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(
+        req: axum::http::Request<axum::body::Body>,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
         if bcs_content_type(req.headers()) {
             let bytes = axum::body::Bytes::from_request(req, state)
                 .await
@@ -102,9 +102,9 @@ impl axum::response::IntoResponse for BcsRejection {
                 "Expected request with `Content-Type: application/bcs`",
             )
                 .into_response(),
-            BcsRejection::DeserializationError(_) => (
+            BcsRejection::DeserializationError(e) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "Failed to deserialize the BCS body into the target type",
+                format!("Failed to deserialize the BCS body into the target type: {e}"),
             )
                 .into_response(),
             BcsRejection::BytesRejection(bytes_rejection) => bytes_rejection.into_response(),
@@ -129,61 +129,43 @@ pub async fn append_info_headers(
     State(state): State<RestService>,
     response: Response,
 ) -> impl IntoResponse {
-    let latest_checkpoint = state.reader.inner().get_latest_checkpoint().unwrap();
-    let lowest_available_checkpoint = state
-        .reader
-        .inner()
-        .get_lowest_available_checkpoint()
-        .unwrap();
+    let mut headers = HeaderMap::new();
 
-    let lowest_available_checkpoint_objects = state
+    if let Ok(chain_id) = state.chain_id().to_string().try_into() {
+        headers.insert(X_SUI_CHAIN_ID, chain_id);
+    }
+
+    if let Ok(chain) = state.chain_id().chain().as_str().try_into() {
+        headers.insert(X_SUI_CHAIN, chain);
+    }
+
+    if let Ok(latest_checkpoint) = state.reader.inner().get_latest_checkpoint() {
+        headers.insert(X_SUI_EPOCH, latest_checkpoint.epoch().into());
+        headers.insert(
+            X_SUI_CHECKPOINT_HEIGHT,
+            latest_checkpoint.sequence_number.into(),
+        );
+        headers.insert(X_SUI_TIMESTAMP_MS, latest_checkpoint.timestamp_ms.into());
+    }
+
+    if let Ok(lowest_available_checkpoint) = state.reader.inner().get_lowest_available_checkpoint()
+    {
+        headers.insert(
+            X_SUI_LOWEST_AVAILABLE_CHECKPOINT,
+            lowest_available_checkpoint.into(),
+        );
+    }
+
+    if let Ok(lowest_available_checkpoint_objects) = state
         .reader
         .inner()
         .get_lowest_available_checkpoint_objects()
-        .unwrap();
-
-    let mut headers = HeaderMap::new();
-
-    headers.insert(
-        X_SUI_CHAIN_ID,
-        state.chain_id().to_string().try_into().unwrap(),
-    );
-    headers.insert(
-        X_SUI_CHAIN,
-        state.chain_id().chain().as_str().try_into().unwrap(),
-    );
-    headers.insert(
-        X_SUI_EPOCH,
-        latest_checkpoint.epoch().to_string().try_into().unwrap(),
-    );
-    headers.insert(
-        X_SUI_CHECKPOINT_HEIGHT,
-        latest_checkpoint
-            .sequence_number()
-            .to_string()
-            .try_into()
-            .unwrap(),
-    );
-    headers.insert(
-        X_SUI_TIMESTAMP_MS,
-        latest_checkpoint
-            .timestamp_ms
-            .to_string()
-            .try_into()
-            .unwrap(),
-    );
-    headers.insert(
-        X_SUI_LOWEST_AVAILABLE_CHECKPOINT,
-        lowest_available_checkpoint.to_string().try_into().unwrap(),
-    );
-
-    headers.insert(
-        X_SUI_LOWEST_AVAILABLE_CHECKPOINT_OBJECTS,
-        lowest_available_checkpoint_objects
-            .to_string()
-            .try_into()
-            .unwrap(),
-    );
+    {
+        headers.insert(
+            X_SUI_LOWEST_AVAILABLE_CHECKPOINT_OBJECTS,
+            lowest_available_checkpoint_objects.into(),
+        );
+    }
 
     (headers, response)
 }

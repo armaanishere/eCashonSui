@@ -32,14 +32,14 @@ module escrow::shared {
         dynamic_object_field::{Self as dof}
     };
 
-    use escrow::lock::{Self, Locked, Key};
+    use escrow::lock::{Locked, Key};
 
     /// The `name` of the DOF that holds the Escrowed object.
     /// Allows easy discoverability for the escrowed object.
     public struct EscrowedObjectKey has copy, store, drop {}
 
     /// An object held in escrow
-    /// 
+    ///
     /// The escrowed object is added as a Dynamic Object Field so it can still be looked-up.
     public struct Escrow<phantom T: key + store> has key, store {
         id: UID,
@@ -173,6 +173,8 @@ module escrow::shared {
     #[test_only] use sui::sui::SUI;
     #[test_only] use sui::test_scenario::{Self as ts, Scenario};
 
+    #[test_only] use escrow::lock;
+
     #[test_only] const ALICE: address = @0xA;
     #[test_only] const BOB: address = @0xB;
     #[test_only] const DIANE: address = @0xD;
@@ -213,6 +215,7 @@ module escrow::shared {
 
         // Bob responds by offering their object, and gets Alice's object in
         // return.
+        // docs::#bob
         {
             ts.next_tx(BOB);
             let escrow: Escrow<Coin<SUI>> = ts.take_shared();
@@ -222,7 +225,9 @@ module escrow::shared {
 
             transfer::public_transfer(c, BOB);
         };
+        // docs::/#bob
 
+        // docs::#finish
         // Commit effects from the swap
         ts.next_tx(@0x0);
 
@@ -237,6 +242,7 @@ module escrow::shared {
             let c: Coin<SUI> = ts.take_from_address_by_id(BOB, i1);
             ts::return_to_address(BOB, c);
         };
+        // docs::/#finish
         //docs::#test-resume
 
         ts::end(ts);

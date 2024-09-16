@@ -12,10 +12,7 @@ use crate::{
         codes::{Category, Declarations, DiagnosticsID, Severity, WarningFilter},
         Diagnostic, Diagnostics, DiagnosticsFormat, WarningFilters,
     },
-    editions::{
-        check_feature_or_error as edition_check_feature, feature_edition_error_msg, Edition,
-        FeatureGate, Flavor,
-    },
+    editions::{check_feature_or_error, feature_edition_error_msg, Edition, FeatureGate, Flavor},
     expansion::ast as E,
     hlir::ast as H,
     naming::ast as N,
@@ -190,6 +187,9 @@ pub const FILTER_UNUSED_MUT_REF: &str = "unused_mut_ref";
 pub const FILTER_UNUSED_MUT_PARAM: &str = "unused_mut_parameter";
 pub const FILTER_IMPLICIT_CONST_COPY: &str = "implicit_const_copy";
 pub const FILTER_DUPLICATE_ALIAS: &str = "duplicate_alias";
+pub const FILTER_DEPRECATED: &str = "deprecated_usage";
+pub const FILTER_IDE_PATH_AUTOCOMPLETE: &str = "ide_path_autocomplete";
+pub const FILTER_IDE_DOT_AUTOCOMPLETE: &str = "ide_dot_autocomplete";
 
 pub type NamedAddressMap = BTreeMap<Symbol, NumericalAddress>;
 
@@ -281,12 +281,12 @@ impl CompilationEnv {
         package_configs: BTreeMap<Symbol, PackageConfig>,
         default_config: Option<PackageConfig>,
     ) -> Self {
-        use crate::diagnostics::codes::{TypeSafety, UnusedItem};
+        use crate::diagnostics::codes::{TypeSafety, UnusedItem, IDE};
         visitors.extend([
             sui_mode::id_leak::IDLeakVerifier.visitor(),
             sui_mode::typing::SuiTypeChecks.visitor(),
         ]);
-        let known_filters_: BTreeMap<FilterName, BTreeSet<WarningFilter>> = BTreeMap::from([
+        let mut known_filters_: BTreeMap<FilterName, BTreeSet<WarningFilter>> = BTreeMap::from([
             (
                 FILTER_ALL.into(),
                 BTreeSet::from([WarningFilter::All(None)]),
@@ -331,7 +331,14 @@ impl CompilationEnv {
             known_code_filter!(FILTER_UNUSED_MUT_PARAM, UnusedItem::MutParam),
             known_code_filter!(FILTER_IMPLICIT_CONST_COPY, TypeSafety::ImplicitConstantCopy),
             known_code_filter!(FILTER_DUPLICATE_ALIAS, Declarations::DuplicateAlias),
+            known_code_filter!(FILTER_DEPRECATED, TypeSafety::DeprecatedUsage),
         ]);
+        if flags.ide_mode() {
+            known_filters_.extend([
+                known_code_filter!(FILTER_IDE_PATH_AUTOCOMPLETE, IDE::PathAutocomplete),
+                known_code_filter!(FILTER_IDE_DOT_AUTOCOMPLETE, IDE::DotAutocomplete),
+            ]);
+        }
         let known_filters: BTreeMap<FilterPrefix, BTreeMap<FilterName, BTreeSet<WarningFilter>>> =
             BTreeMap::from([(None, known_filters_)]);
 
@@ -578,7 +585,7 @@ impl CompilationEnv {
         feature: FeatureGate,
         loc: Loc,
     ) -> bool {
-        edition_check_feature(self, self.package_config(package).edition, feature, loc)
+        check_feature_or_error(self, self.package_config(package).edition, feature, loc)
     }
 
     // Returns an error string if if the feature isn't supported, or None otherwise.
@@ -602,6 +609,14 @@ impl CompilationEnv {
         package
             .and_then(|p| self.package_configs.get(&p))
             .unwrap_or(&self.default_config)
+    }
+
+    pub fn package_configs(&self) -> impl Iterator<Item = (Option<Symbol>, &PackageConfig)> {
+        std::iter::once((None, &self.default_config)).chain(
+            self.package_configs
+                .iter()
+                .map(|(n, config)| (Some(*n), config)),
+        )
     }
 
     pub fn set_primitive_type_definers(
@@ -667,7 +682,7 @@ impl CompilationEnv {
         if self.flags().ide_test_mode() {
             for entry in info.annotations.iter() {
                 let diag = entry.clone().into();
-                self.diags.add(diag);
+                self.add_diag(diag);
             }
         }
         self.ide_information.extend(info);
@@ -676,7 +691,7 @@ impl CompilationEnv {
     pub fn add_ide_annotation(&mut self, loc: Loc, info: IDEAnnotation) {
         if self.flags().ide_test_mode() {
             let diag = (loc, info.clone()).into();
-            self.diags.add(diag);
+            self.add_diag(diag);
         }
         self.ide_information.add_ide_annotation(loc, info);
     }

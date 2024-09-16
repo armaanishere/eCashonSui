@@ -48,7 +48,7 @@ impl Payload for SharedCounterTestPayload {
     fn make_new_payload(&mut self, effects: &ExecutionEffects) {
         if !effects.is_ok() {
             effects.print_gas_summary();
-            error!("Shared counter tx failed...");
+            error!("Shared counter tx failed... Status: {:?}", effects.status());
         }
         self.gas.0 = effects.gas_object().0;
     }
@@ -230,11 +230,12 @@ impl Workload<dyn Payload> for SharedCounterWorkload {
                 .build_and_sign(keypair.as_ref());
             let proxy_ref = proxy.clone();
             futures.push(async move {
-                if let Ok(effects) = proxy_ref.execute_transaction_block(transaction).await {
-                    effects.created()[0].0
-                } else {
-                    panic!("Failed to create shared counter!");
-                }
+                proxy_ref
+                    .execute_transaction_block(transaction)
+                    .await
+                    .unwrap()
+                    .created()[0]
+                    .0
             });
         }
         self.counters = join_all(futures).await;

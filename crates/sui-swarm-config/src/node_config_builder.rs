@@ -16,15 +16,16 @@ use sui_config::node::{
     Genesis, KeyPairWithPath, StateArchiveConfig, StateSnapshotConfig,
     DEFAULT_GRPC_CONCURRENCY_LIMIT,
 };
-use sui_config::node::{default_zklogin_oauth_providers, ConsensusProtocol, RunWithRange};
+use sui_config::node::{default_zklogin_oauth_providers, RunWithRange};
 use sui_config::p2p::{P2pConfig, SeedPeer, StateSyncConfig};
+use sui_config::verifier_signing_config::VerifierSigningConfig;
 use sui_config::{
     local_ip_utils, ConsensusConfig, NodeConfig, AUTHORITIES_DB_NAME, CONSENSUS_DB_NAME,
     FULL_NODE_DB_PATH,
 };
-use sui_protocol_config::SupportedProtocolVersions;
 use sui_types::crypto::{AuthorityKeyPair, AuthorityPublicKeyBytes, NetworkKeyPair, SuiKeyPair};
 use sui_types::multiaddr::Multiaddr;
+use sui_types::supported_protocol_versions::SupportedProtocolVersions;
 use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig};
 
 /// This builder contains information that's not included in ValidatorGenesisConfig for building
@@ -131,16 +132,15 @@ impl ValidatorConfigBuilder {
         let network_address = validator.network_address;
         let consensus_address = validator.consensus_address;
         let consensus_db_path = config_directory.join(CONSENSUS_DB_NAME).join(key_path);
-        let internal_worker_address = validator.consensus_internal_worker_address;
         let localhost = local_ip_utils::localhost_for_testing();
         let consensus_config = ConsensusConfig {
             address: consensus_address,
             db_path: consensus_db_path,
-            internal_worker_address,
+            db_retention_epochs: None,
+            db_pruner_period_secs: None,
             max_pending_transactions: None,
             max_submit_position: self.max_submit_position,
             submit_delay_step_override_millis: self.submit_delay_step_override_millis,
-            protocol: ConsensusProtocol::Narwhal,
             narwhal_config: narwhal_config::Parameters {
                 network_admin_server: NetworkAdminServerParameters {
                     primary_network_admin_server_port: local_ip_utils::get_available_port(
@@ -155,6 +155,7 @@ impl ValidatorConfigBuilder {
                 },
                 ..Default::default()
             },
+            parameters: Default::default(),
         };
 
         let p2p_config = P2pConfig {
@@ -239,6 +240,9 @@ impl ValidatorConfigBuilder {
             execution_cache: ExecutionCacheConfig::default(),
             state_accumulator_v2: self.state_accumulator_v2,
             enable_soft_bundle: true,
+            enable_validator_tx_finalizer: true,
+            verifier_signing_config: VerifierSigningConfig::default(),
+            enable_db_write_stall: None,
         }
     }
 
@@ -273,6 +277,7 @@ pub struct FullnodeConfigBuilder {
     run_with_range: Option<RunWithRange>,
     policy_config: Option<PolicyConfig>,
     fw_config: Option<RemoteFirewallConfig>,
+    data_ingestion_dir: Option<PathBuf>,
 }
 
 impl FullnodeConfigBuilder {
@@ -380,6 +385,11 @@ impl FullnodeConfigBuilder {
         self
     }
 
+    pub fn with_data_ingestion_dir(mut self, path: Option<PathBuf>) -> Self {
+        self.data_ingestion_dir = path;
+        self
+    }
+
     pub fn build<R: rand::RngCore + rand::CryptoRng>(
         self,
         rng: &mut R,
@@ -443,6 +453,11 @@ impl FullnodeConfigBuilder {
             format!("{}:{}", ip, rpc_port).parse().unwrap()
         });
 
+        let checkpoint_executor_config = CheckpointExecutorConfig {
+            data_ingestion_dir: self.data_ingestion_dir,
+            ..Default::default()
+        };
+
         NodeConfig {
             protocol_key_pair: AuthorityKeyPairWithPath::new(validator_config.key_pair),
             account_key_pair: KeyPairWithPath::new(validator_config.account_key_pair),
@@ -477,7 +492,7 @@ impl FullnodeConfigBuilder {
             authority_store_pruning_config: AuthorityStorePruningConfig::default(),
             end_of_epoch_broadcast_channel_capacity:
                 default_end_of_epoch_broadcast_channel_capacity(),
-            checkpoint_executor_config: Default::default(),
+            checkpoint_executor_config,
             metrics: None,
             supported_protocol_versions: self.supported_protocol_versions,
             db_checkpoint_config: self.db_checkpoint_config.unwrap_or_default(),
@@ -509,6 +524,10 @@ impl FullnodeConfigBuilder {
             execution_cache: ExecutionCacheConfig::default(),
             state_accumulator_v2: true,
             enable_soft_bundle: true,
+            // This is a validator specific feature.
+            enable_validator_tx_finalizer: false,
+            verifier_signing_config: VerifierSigningConfig::default(),
+            enable_db_write_stall: None,
         }
     }
 }

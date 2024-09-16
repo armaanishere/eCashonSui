@@ -34,6 +34,7 @@ use sui_types::effects::{TransactionEffects, TransactionEffectsAPI, TransactionE
 use sui_types::error::{ExecutionError, SuiError, SuiResult};
 use sui_types::execution_status::ExecutionStatus;
 use sui_types::gas::GasCostSummary;
+use sui_types::layout_resolver::{get_layout_from_struct_tag, LayoutResolver};
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::messages_consensus::ConsensusDeterminedVersionAssignments;
 use sui_types::object::Owner;
@@ -48,9 +49,8 @@ use sui_types::sui_serde::{
 use sui_types::transaction::{
     Argument, CallArg, ChangeEpoch, Command, EndOfEpochTransactionKind, GenesisObject,
     InputObjectKind, ObjectArg, ProgrammableMoveCall, ProgrammableTransaction, SenderSignedData,
-    TransactionData, TransactionDataAPI, TransactionKind, VersionedProtocolMessage,
+    TransactionData, TransactionDataAPI, TransactionKind,
 };
-use sui_types::type_resolver::{get_layout_from_struct_tag, LayoutResolver};
 use sui_types::SUI_FRAMEWORK_ADDRESS;
 
 use crate::balance_changes::BalanceChange;
@@ -180,6 +180,10 @@ impl SuiTransactionBlockResponseOptions {
         }
     }
 
+    #[deprecated(
+        since = "1.33.0",
+        note = "Balance and object changes no longer require local execution"
+    )]
     pub fn require_local_execution(&self) -> bool {
         self.show_balance_changes || self.show_object_changes
     }
@@ -1447,9 +1451,7 @@ impl SuiTransactionBlockData {
         data: TransactionData,
         module_cache: &impl GetModule,
     ) -> Result<Self, anyhow::Error> {
-        let message_version = data
-            .message_version()
-            .expect("TransactionData defines message_version()");
+        let message_version = data.message_version();
         let sender = data.sender();
         let gas_data = SuiGasData {
             payment: data
@@ -1479,9 +1481,7 @@ impl SuiTransactionBlockData {
         data: TransactionData,
         package_resolver: Arc<Resolver<impl PackageStore>>,
     ) -> Result<Self, anyhow::Error> {
-        let message_version = data
-            .message_version()
-            .expect("TransactionData defines message_version()");
+        let message_version = data.message_version();
         let sender = data.sender();
         let gas_data = SuiGasData {
             payment: data
@@ -1803,7 +1803,7 @@ impl SuiProgrammableTransactionBlock {
     }
 
     fn resolve_input_type(
-        inputs: &Vec<CallArg>,
+        inputs: &[CallArg],
         commands: &[Command],
         module_cache: &impl GetModule,
     ) -> Vec<Option<MoveTypeLayout>> {

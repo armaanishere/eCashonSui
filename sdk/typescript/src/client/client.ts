@@ -118,13 +118,11 @@ type NetworkOrTransport =
 			url?: never;
 	  };
 
-const SUI_CLIENT_BRAND = Symbol.for('@mysten/SuiClient');
+const SUI_CLIENT_BRAND = Symbol.for('@mysten/SuiClient') as never;
 
 export function isSuiClient(client: unknown): client is SuiClient {
 	return (
-		typeof client === 'object' &&
-		client !== null &&
-		(client as { [SUI_CLIENT_BRAND]: unknown })[SUI_CLIENT_BRAND] === true
+		typeof client === 'object' && client !== null && (client as any)[SUI_CLIENT_BRAND] === true
 	);
 }
 
@@ -408,20 +406,32 @@ export class SuiClient {
 		});
 	}
 
-	async executeTransactionBlock(
-		input: ExecuteTransactionBlockParams,
-	): Promise<SuiTransactionBlockResponse> {
-		return await this.transport.request({
+	async executeTransactionBlock({
+		transactionBlock,
+		signature,
+		options,
+		requestType,
+	}: ExecuteTransactionBlockParams): Promise<SuiTransactionBlockResponse> {
+		const result: SuiTransactionBlockResponse = await this.transport.request({
 			method: 'sui_executeTransactionBlock',
 			params: [
-				typeof input.transactionBlock === 'string'
-					? input.transactionBlock
-					: toB64(input.transactionBlock),
-				Array.isArray(input.signature) ? input.signature : [input.signature],
-				input.options,
-				input.requestType,
+				typeof transactionBlock === 'string' ? transactionBlock : toB64(transactionBlock),
+				Array.isArray(signature) ? signature : [signature],
+				options,
 			],
 		});
+
+		if (requestType === 'WaitForLocalExecution') {
+			try {
+				await this.waitForTransaction({
+					digest: result.digest,
+				});
+			} catch (_) {
+				// Ignore error while waiting for transaction
+			}
+		}
+
+		return result;
 	}
 
 	async signAndExecuteTransaction({
@@ -525,6 +535,8 @@ export class SuiClient {
 
 	/**
 	 * Subscribe to get notifications whenever an event matching the filter occurs
+	 *
+	 * @deprecated
 	 */
 	async subscribeEvent(
 		input: SubscribeEventParams & {
@@ -540,6 +552,9 @@ export class SuiClient {
 		});
 	}
 
+	/**
+	 * @deprecated
+	 */
 	async subscribeTransaction(
 		input: SubscribeTransactionParams & {
 			/** function to run when we receive a notification of a new event matching the filter */

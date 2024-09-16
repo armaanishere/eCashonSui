@@ -4,7 +4,7 @@
 import { toB64 } from '@mysten/bcs';
 
 import { bcs } from '../../bcs/index.js';
-import type { SuiClient } from '../../client/index.js';
+import type { SuiClient, SuiTransactionBlockResponseOptions } from '../../client/index.js';
 import type { Signer } from '../../cryptography/keypair.js';
 import type { ObjectCacheOptions } from '../ObjectCache.js';
 import { isTransaction, Transaction } from '../Transaction.js';
@@ -15,18 +15,20 @@ export class SerialTransactionExecutor {
 	#queue = new SerialQueue();
 	#signer: Signer;
 	#cache: CachingTransactionExecutor;
-	#client: SuiClient;
-	#lastDigest: string | null = null;
+	#defaultGasBudget: bigint;
 
 	constructor({
 		signer,
+		defaultGasBudget = 50_000_000n,
 		...options
 	}: Omit<ObjectCacheOptions, 'address'> & {
 		client: SuiClient;
 		signer: Signer;
+		/** The gasBudget to use if the transaction has not defined it's own gasBudget, defaults to `50_000_000n` */
+		defaultGasBudget?: bigint;
 	}) {
 		this.#signer = signer;
-		this.#client = options.client;
+		this.#defaultGasBudget = defaultGasBudget;
 		this.#cache = new CachingTransactionExecutor({
 			client: options.client,
 			cache: options.cache,
@@ -66,23 +68,24 @@ export class SerialTransactionExecutor {
 			copy.setGasPayment([gasCoin]);
 		}
 
+		copy.setGasBudgetIfNotSet(this.#defaultGasBudget);
 		copy.setSenderIfNotSet(this.#signer.toSuiAddress());
 
 		return this.#cache.buildTransaction({ transaction: copy });
 	};
 
 	resetCache() {
-		return Promise.all([this.#cache.reset(), this.#waitForLastTransaction()]);
+		return this.#cache.reset();
 	}
 
-	async #waitForLastTransaction() {
-		if (this.#lastDigest) {
-			await this.#client.waitForTransaction({ digest: this.#lastDigest });
-			this.#lastDigest = null;
-		}
+	waitForLastTransaction() {
+		return this.#cache.waitForLastTransaction();
 	}
 
-	executeTransaction(transaction: Transaction | Uint8Array) {
+	executeTransaction(
+		transaction: Transaction | Uint8Array,
+		options?: SuiTransactionBlockResponseOptions,
+	) {
 		return this.#queue.runTask(async () => {
 			const bytes = isTransaction(transaction)
 				? await this.#buildTransaction(transaction)
@@ -93,6 +96,7 @@ export class SerialTransactionExecutor {
 				.executeTransaction({
 					signature,
 					transaction: bytes,
+					options,
 				})
 				.catch(async (error) => {
 					await this.resetCache();
@@ -102,11 +106,11 @@ export class SerialTransactionExecutor {
 			const effectsBytes = Uint8Array.from(results.rawEffects!);
 			const effects = bcs.TransactionEffects.parse(effectsBytes);
 			await this.applyEffects(effects);
-			this.#lastDigest = results.digest;
 
 			return {
 				digest: results.digest,
 				effects: toB64(effectsBytes),
+				data: results,
 			};
 		});
 	}

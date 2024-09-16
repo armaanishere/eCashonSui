@@ -8,6 +8,7 @@ use mysten_metrics::{
     monitored_mpsc::{channel, Receiver, Sender, WeakSender},
     monitored_scope, spawn_logged_monitored_task,
 };
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{oneshot, watch};
 use tracing::warn;
@@ -54,6 +55,8 @@ pub trait CoreThreadDispatcher: Sync + Send + 'static {
     /// This is only used by core to decide if it should propose new blocks.
     /// It is not a guarantee that produced blocks will be accepted by peers.
     fn set_consumer_availability(&self, available: bool) -> Result<(), CoreError>;
+
+    fn set_last_known_proposed_round(&self, round: Round) -> Result<(), CoreError>;
 }
 
 pub(crate) struct CoreThreadHandle {
@@ -73,6 +76,7 @@ struct CoreThread {
     core: Core,
     receiver: Receiver<CoreThreadCommand>,
     rx_consumer_availability: watch::Receiver<bool>,
+    rx_last_known_proposed_round: watch::Receiver<Round>,
     context: Arc<Context>,
 }
 
@@ -104,6 +108,12 @@ impl CoreThread {
                         }
                     }
                 }
+                _ = self.rx_last_known_proposed_round.changed() => {
+                    let _scope = monitored_scope("CoreThread::loop::set_last_known_proposed_round");
+                    let round = *self.rx_last_known_proposed_round.borrow();
+                    self.core.set_last_known_proposed_round(round);
+                    self.core.new_block(round + 1, true)?;
+                }
                 _ = self.rx_consumer_availability.changed() => {
                     let _scope = monitored_scope("CoreThread::loop::set_consumer_availability");
                     let available = *self.rx_consumer_availability.borrow();
@@ -126,6 +136,7 @@ pub(crate) struct ChannelCoreThreadDispatcher {
     context: Arc<Context>,
     sender: WeakSender<CoreThreadCommand>,
     tx_consumer_availability: Arc<watch::Sender<bool>>,
+    tx_last_known_proposed_round: Arc<watch::Sender<Round>>,
 }
 
 impl ChannelCoreThreadDispatcher {
@@ -133,11 +144,14 @@ impl ChannelCoreThreadDispatcher {
         let (sender, receiver) =
             channel("consensus_core_commands", CORE_THREAD_COMMANDS_CHANNEL_SIZE);
         let (tx_consumer_availability, mut rx_consumer_availability) = watch::channel(false);
+        let (tx_last_known_proposed_round, mut rx_last_known_proposed_round) = watch::channel(0);
         rx_consumer_availability.mark_unchanged();
+        rx_last_known_proposed_round.mark_unchanged();
         let core_thread = CoreThread {
             core,
             receiver,
             rx_consumer_availability,
+            rx_last_known_proposed_round,
             context: context.clone(),
         };
 
@@ -158,6 +172,7 @@ impl ChannelCoreThreadDispatcher {
             context,
             sender: sender.downgrade(),
             tx_consumer_availability: Arc::new(tx_consumer_availability),
+            tx_last_known_proposed_round: Arc::new(tx_last_known_proposed_round),
         };
         let handle = CoreThreadHandle {
             join_handle,
@@ -209,6 +224,73 @@ impl CoreThreadDispatcher for ChannelCoreThreadDispatcher {
             .send(available)
             .map_err(|e| Shutdown(e.to_string()))
     }
+
+    fn set_last_known_proposed_round(&self, round: Round) -> Result<(), CoreError> {
+        self.tx_last_known_proposed_round
+            .send(round)
+            .map_err(|e| Shutdown(e.to_string()))
+    }
+}
+
+// TODO: complete the Mock for thread dispatcher to be used from several tests
+#[derive(Default)]
+pub(crate) struct MockCoreThreadDispatcher {
+    add_blocks: Mutex<Vec<VerifiedBlock>>,
+    missing_blocks: Mutex<BTreeSet<BlockRef>>,
+    last_known_proposed_round: Mutex<Vec<Round>>,
+}
+
+impl MockCoreThreadDispatcher {
+    #[cfg(test)]
+    pub(crate) async fn get_add_blocks(&self) -> Vec<VerifiedBlock> {
+        let mut add_blocks = self.add_blocks.lock();
+        add_blocks.drain(0..).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stub_missing_blocks(&self, block_refs: BTreeSet<BlockRef>) {
+        let mut missing_blocks = self.missing_blocks.lock();
+        missing_blocks.extend(block_refs);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get_last_own_proposed_round(&self) -> Vec<Round> {
+        let last_known_proposed_round = self.last_known_proposed_round.lock();
+        last_known_proposed_round.clone()
+    }
+}
+
+#[async_trait]
+impl CoreThreadDispatcher for MockCoreThreadDispatcher {
+    async fn add_blocks(
+        &self,
+        blocks: Vec<VerifiedBlock>,
+    ) -> Result<BTreeSet<BlockRef>, CoreError> {
+        let mut add_blocks = self.add_blocks.lock();
+        add_blocks.extend(blocks);
+        Ok(BTreeSet::new())
+    }
+
+    async fn new_block(&self, _round: Round, _force: bool) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    async fn get_missing_blocks(&self) -> Result<BTreeSet<BlockRef>, CoreError> {
+        let mut missing_blocks = self.missing_blocks.lock();
+        let result = missing_blocks.clone();
+        missing_blocks.clear();
+        Ok(result)
+    }
+
+    fn set_consumer_availability(&self, _available: bool) -> Result<(), CoreError> {
+        todo!()
+    }
+
+    fn set_last_known_proposed_round(&self, round: Round) -> Result<(), CoreError> {
+        let mut last_known_proposed_round = self.last_known_proposed_round.lock();
+        last_known_proposed_round.push(round);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -243,7 +325,7 @@ mod test {
             Arc::new(NoopBlockVerifier),
         );
         let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
-        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone(), None);
+        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
         let (signals, signal_receivers) = CoreSignals::new(context.clone());
         let _block_receiver = signal_receivers.block_broadcast_receiver();
         let (sender, _receiver) = unbounded_channel("consensus_output");
@@ -253,7 +335,7 @@ mod test {
         ));
         let commit_observer = CommitObserver::new(
             context.clone(),
-            CommitConsumer::new(sender.clone(), 0, 0),
+            CommitConsumer::new(sender.clone(), 0),
             dag_state.clone(),
             store,
             leader_schedule.clone(),
@@ -272,6 +354,7 @@ mod test {
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state,
+            false,
         );
 
         let (core_dispatcher, handle) = ChannelCoreThreadDispatcher::start(core, context);

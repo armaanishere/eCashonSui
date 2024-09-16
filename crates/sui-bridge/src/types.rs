@@ -14,6 +14,7 @@ use ethers::types::Address as EthAddress;
 use ethers::types::Log;
 use ethers::types::H256;
 pub use ethers::types::H256 as EthTransactionHash;
+use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::hash::{HashFunction, Keccak256};
 use num_enum::TryFromPrimitive;
 use rand::seq::SliceRandom;
@@ -35,6 +36,7 @@ use sui_types::bridge::{
 };
 use sui_types::committee::CommitteeTrait;
 use sui_types::committee::StakeUnit;
+use sui_types::crypto::ToFromBytes;
 use sui_types::digests::{Digest, TransactionDigest};
 use sui_types::message_envelope::{Envelope, Message, VerifiedEnvelope};
 use sui_types::TypeTag;
@@ -42,6 +44,10 @@ use sui_types::TypeTag;
 pub const BRIDGE_AUTHORITY_TOTAL_VOTING_POWER: u64 = 10000;
 
 pub const USD_MULTIPLIER: u64 = 10000; // decimal places = 4
+
+pub type IsBridgePaused = bool;
+pub const BRIDGE_PAUSED: bool = true;
+pub const BRIDGE_UNPAUSED: bool = false;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct BridgeAuthority {
@@ -115,19 +121,37 @@ impl BridgeCommittee {
     }
 }
 
+impl core::fmt::Display for BridgeCommittee {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+        for m in self.members.values() {
+            writeln!(
+                f,
+                "pubkey: {:?}, url: {:?}, stake: {:?}, blocklisted: {}, eth address: {:x}",
+                Hex::encode(m.pubkey_bytes().as_bytes()),
+                m.base_url,
+                m.voting_power,
+                m.is_blocklisted,
+                m.pubkey_bytes().to_eth_address(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl CommitteeTrait<BridgeAuthorityPublicKeyBytes> for BridgeCommittee {
-    // Note:
-    // 1. preference is not supported today.
-    // 2. blocklisted members are always excluded.
+    // Note: blocklisted members are always excluded.
     fn shuffle_by_stake_with_rng(
         &self,
-        // preference is not supported today
-        _preferences: Option<&BTreeSet<BridgeAuthorityPublicKeyBytes>>,
+        // `preferences` is used as a *flag* here to influence the order of validators to be requested.
+        //  * if `Some(_)`, then we will request validators in the order of the voting power
+        //  * if `None`, we still refer to voting power, but they are shuffled by randomness.
+        //  to save gas cost.
+        preferences: Option<&BTreeSet<BridgeAuthorityPublicKeyBytes>>,
         // only attempt from these authorities.
         restrict_to: Option<&BTreeSet<BridgeAuthorityPublicKeyBytes>>,
         rng: &mut impl Rng,
     ) -> Vec<BridgeAuthorityPublicKeyBytes> {
-        let candidates = self
+        let mut candidates = self
             .members
             .iter()
             .filter_map(|(name, a)| {
@@ -146,14 +170,18 @@ impl CommitteeTrait<BridgeAuthorityPublicKeyBytes> for BridgeCommittee {
                 }
             })
             .collect::<Vec<_>>();
-
-        candidates
-            .choose_multiple_weighted(rng, candidates.len(), |(_, weight)| *weight as f64)
-            // Unwrap safe: it panics when the third parameter is larger than the size of the slice
-            .unwrap()
-            .map(|(name, _)| name)
-            .cloned()
-            .collect()
+        if preferences.is_some() {
+            candidates.sort_by(|(_, a), (_, b)| b.cmp(a));
+            candidates.iter().map(|(name, _)| name.clone()).collect()
+        } else {
+            candidates
+                .choose_multiple_weighted(rng, candidates.len(), |(_, weight)| *weight as f64)
+                // Unwrap safe: it panics when the third parameter is larger than the size of the slice
+                .unwrap()
+                .map(|(name, _)| name)
+                .cloned()
+                .collect()
+        }
     }
 
     fn weight(&self, author: &BridgeAuthorityPublicKeyBytes) -> StakeUnit {
@@ -164,7 +192,7 @@ impl CommitteeTrait<BridgeAuthorityPublicKeyBytes> for BridgeCommittee {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Copy, Clone, PartialEq, Eq, TryFromPrimitive, Hash)]
 #[repr(u8)]
 pub enum BridgeActionType {
     TokenTransfer = 0,
@@ -345,7 +373,7 @@ impl BridgeAction {
     // Digest of BridgeAction (with Keccak256 hasher)
     pub fn digest(&self) -> BridgeActionDigest {
         let mut hasher = Keccak256::default();
-        hasher.update(&self.to_bytes());
+        hasher.update(self.to_bytes());
         BridgeActionDigest::new(hasher.finalize().into())
     }
 
@@ -478,8 +506,46 @@ pub struct EthLog {
     pub block_number: u64,
     pub tx_hash: H256,
     pub log_index_in_tx: u16,
-    // TODO: pull necessary fields from `Log`.
     pub log: Log,
+}
+
+/// The version of EthLog that does not have
+/// `log_index_in_tx`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawEthLog {
+    pub block_number: u64,
+    pub tx_hash: H256,
+    pub log: Log,
+}
+
+pub trait EthEvent {
+    fn block_number(&self) -> u64;
+    fn tx_hash(&self) -> H256;
+    fn log(&self) -> &Log;
+}
+
+impl EthEvent for EthLog {
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
+    fn tx_hash(&self) -> H256 {
+        self.tx_hash
+    }
+    fn log(&self) -> &Log {
+        &self.log
+    }
+}
+
+impl EthEvent for RawEthLog {
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
+    fn tx_hash(&self) -> H256 {
+        self.tx_hash
+    }
+    fn log(&self) -> &Log {
+        &self.log
+    }
 }
 
 /// Check if the bridge route is valid
@@ -617,7 +683,7 @@ mod tests {
         let action = get_test_sui_to_eth_bridge_action(None, None, None, None, None, None, None);
         assert_eq!(action.approval_threshold(), 3334);
 
-        let action = get_test_eth_to_sui_bridge_action(None, None, None);
+        let action = get_test_eth_to_sui_bridge_action(None, None, None, None);
         assert_eq!(action.approval_threshold(), 3334);
 
         let action = BridgeAction::BlocklistCommitteeAction(BlocklistCommitteeAction {

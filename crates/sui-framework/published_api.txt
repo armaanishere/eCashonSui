@@ -985,48 +985,6 @@ ecvrf_verify
 ed25519_verify
 	public fun
 	0x2::ed25519
-Curve
-	public struct
-	0x2::groth16
-PreparedVerifyingKey
-	public struct
-	0x2::groth16
-PublicProofInputs
-	public struct
-	0x2::groth16
-ProofPoints
-	public struct
-	0x2::groth16
-bls12381
-	public fun
-	0x2::groth16
-bn254
-	public fun
-	0x2::groth16
-pvk_from_bytes
-	public fun
-	0x2::groth16
-pvk_to_bytes
-	public fun
-	0x2::groth16
-public_proof_inputs_from_bytes
-	public fun
-	0x2::groth16
-proof_points_from_bytes
-	public fun
-	0x2::groth16
-prepare_verifying_key
-	public fun
-	0x2::groth16
-prepare_verifying_key_internal
-	fun
-	0x2::groth16
-verify_groth16_proof
-	public fun
-	0x2::groth16
-verify_groth16_proof_internal
-	fun
-	0x2::groth16
 blake2b256
 	public fun
 	0x2::hash
@@ -1432,6 +1390,12 @@ peel_bool
 peel_u8
 	public fun
 	0x2::bcs
+peel_u16
+	public fun
+	0x2::bcs
+peel_u32
+	public fun
+	0x2::bcs
 peel_u64
 	public fun
 	0x2::bcs
@@ -1456,10 +1420,19 @@ peel_vec_u8
 peel_vec_vec_u8
 	public fun
 	0x2::bcs
+peel_vec_u16
+	public fun
+	0x2::bcs
+peel_vec_u32
+	public fun
+	0x2::bcs
 peel_vec_u64
 	public fun
 	0x2::bcs
 peel_vec_u128
+	public fun
+	0x2::bcs
+peel_vec_u256
 	public fun
 	0x2::bcs
 peel_option_address
@@ -1471,10 +1444,19 @@ peel_option_bool
 peel_option_u8
 	public fun
 	0x2::bcs
+peel_option_u16
+	public fun
+	0x2::bcs
+peel_option_u32
+	public fun
+	0x2::bcs
 peel_option_u64
 	public fun
 	0x2::bcs
 peel_option_u128
+	public fun
+	0x2::bcs
+peel_option_u256
 	public fun
 	0x2::bcs
 Element
@@ -1789,28 +1771,166 @@ destroy_empty
 drop
 	public fun
 	0x2::table
+emit
+	public fun
+	0x2::event
+Wrapper
+	public struct
+	0x2::dynamic_object_field
+add
+	public fun
+	0x2::dynamic_object_field
+borrow
+	public fun
+	0x2::dynamic_object_field
+borrow_mut
+	public fun
+	0x2::dynamic_object_field
+remove
+	public fun
+	0x2::dynamic_object_field
+exists_
+	public fun
+	0x2::dynamic_object_field
+exists_with_type
+	public fun
+	0x2::dynamic_object_field
+id
+	public fun
+	0x2::dynamic_object_field
+internal_add
+	public(package) fun
+	0x2::dynamic_object_field
+internal_borrow
+	public(package) fun
+	0x2::dynamic_object_field
+internal_borrow_mut
+	public(package) fun
+	0x2::dynamic_object_field
+internal_remove
+	public(package) fun
+	0x2::dynamic_object_field
+internal_exists_with_type
+	public(package) fun
+	0x2::dynamic_object_field
+Config
+	public struct
+	0x2::config
+Setting
+	public struct
+	0x2::config
+SettingData
+	public struct
+	0x2::config
+new
+	public(package) fun
+	0x2::config
+share
+	public(package) fun
+	0x2::config
+transfer
+	public(package) fun
+	0x2::config
+add_for_next_epoch
+	public(package) fun
+	0x2::config
+remove_for_next_epoch
+	public(package) fun
+	0x2::config
+exists_with_type
+	public(package) fun
+	0x2::config
+exists_with_type_for_next_epoch
+	public(package) fun
+	0x2::config
+borrow_for_next_epoch_mut
+	public(package) fun
+	0x2::config
+read_setting_for_next_epoch
+	public(package) fun
+	0x2::config
+read_setting
+	public(package) fun
+	0x2::config
+read_setting_impl
+	fun
+	0x2::config
 DenyList
+	public struct
+	0x2::deny_list
+ConfigWriteCap
+	public struct
+	0x2::deny_list
+ConfigKey
+	public struct
+	0x2::deny_list
+AddressKey
+	public struct
+	0x2::deny_list
+GlobalPauseKey
+	public struct
+	0x2::deny_list
+PerTypeConfigCreated
 	public struct
 	0x2::deny_list
 PerTypeList
 	public struct
 	0x2::deny_list
-add
+v2_add
 	public(package) fun
 	0x2::deny_list
-per_type_list_add
+v2_remove
+	public(package) fun
+	0x2::deny_list
+v2_contains_current_epoch
+	public(package) fun
+	0x2::deny_list
+v2_contains_next_epoch
+	public(package) fun
+	0x2::deny_list
+v2_enable_global_pause
+	public(package) fun
+	0x2::deny_list
+v2_disable_global_pause
+	public(package) fun
+	0x2::deny_list
+v2_is_global_pause_enabled_current_epoch
+	public(package) fun
+	0x2::deny_list
+v2_is_global_pause_enabled_next_epoch
+	public(package) fun
+	0x2::deny_list
+migrate_v1_to_v2
+	public(package) fun
+	0x2::deny_list
+add_per_type_config
 	fun
 	0x2::deny_list
-remove
-	public(package) fun
-	0x2::deny_list
-per_type_list_remove
+borrow_per_type_config_mut
 	fun
 	0x2::deny_list
-contains
+borrow_per_type_config
+	fun
+	0x2::deny_list
+per_type_exists
+	fun
+	0x2::deny_list
+v1_add
 	public(package) fun
 	0x2::deny_list
-per_type_list_contains
+v1_per_type_list_add
+	fun
+	0x2::deny_list
+v1_remove
+	public(package) fun
+	0x2::deny_list
+v1_per_type_list_remove
+	fun
+	0x2::deny_list
+v1_contains
+	public(package) fun
+	0x2::deny_list
+v1_per_type_list_contains
 	fun
 	0x2::deny_list
 create
@@ -1831,10 +1951,13 @@ RegulatedCoinMetadata
 TreasuryCap
 	public struct
 	0x2::coin
-DenyCap
+DenyCapV2
 	public struct
 	0x2::coin
 CurrencyCreated
+	public struct
+	0x2::coin
+DenyCap
 	public struct
 	0x2::coin
 total_supply
@@ -1888,7 +2011,10 @@ destroy_zero
 create_currency
 	public fun
 	0x2::coin
-create_regulated_currency
+create_regulated_currency_v2
+	public fun
+	0x2::coin
+migrate_regulated_currency_to_v2
 	public fun
 	0x2::coin
 mint
@@ -1900,13 +2026,28 @@ mint_balance
 burn
 	public entry fun
 	0x2::coin
-deny_list_add
+deny_list_v2_add
 	public fun
 	0x2::coin
-deny_list_remove
+deny_list_v2_remove
 	public fun
 	0x2::coin
-deny_list_contains
+deny_list_v2_contains_current_epoch
+	public fun
+	0x2::coin
+deny_list_v2_contains_next_epoch
+	public fun
+	0x2::coin
+deny_list_v2_enable_global_pause
+	public fun
+	0x2::coin
+deny_list_v2_disable_global_pause
+	public fun
+	0x2::coin
+deny_list_v2_is_global_pause_enabled_current_epoch
+	public fun
+	0x2::coin
+deny_list_v2_is_global_pause_enabled_next_epoch
 	public fun
 	0x2::coin
 mint_and_transfer
@@ -1940,6 +2081,18 @@ get_icon_url
 	public fun
 	0x2::coin
 supply
+	public fun
+	0x2::coin
+create_regulated_currency
+	public fun
+	0x2::coin
+deny_list_add
+	public fun
+	0x2::coin
+deny_list_remove
+	public fun
+	0x2::coin
+deny_list_contains
 	public fun
 	0x2::coin
 VecMap
@@ -2089,9 +2242,6 @@ commit_upgrade
 restrict
 	fun
 	0x2::package
-emit
-	public fun
-	0x2::event
 Display
 	public struct
 	0x2::display
@@ -2140,30 +2290,48 @@ create_internal
 add_internal
 	fun
 	0x2::display
-Wrapper
+Curve
 	public struct
-	0x2::dynamic_object_field
-add
+	0x2::groth16
+PreparedVerifyingKey
+	public struct
+	0x2::groth16
+PublicProofInputs
+	public struct
+	0x2::groth16
+ProofPoints
+	public struct
+	0x2::groth16
+bls12381
 	public fun
-	0x2::dynamic_object_field
-borrow
+	0x2::groth16
+bn254
 	public fun
-	0x2::dynamic_object_field
-borrow_mut
+	0x2::groth16
+pvk_from_bytes
 	public fun
-	0x2::dynamic_object_field
-remove
+	0x2::groth16
+pvk_to_bytes
 	public fun
-	0x2::dynamic_object_field
-exists_
+	0x2::groth16
+public_proof_inputs_from_bytes
 	public fun
-	0x2::dynamic_object_field
-exists_with_type
+	0x2::groth16
+proof_points_from_bytes
 	public fun
-	0x2::dynamic_object_field
-id
+	0x2::groth16
+prepare_verifying_key
 	public fun
-	0x2::dynamic_object_field
+	0x2::groth16
+prepare_verifying_key_internal
+	fun
+	0x2::groth16
+verify_groth16_proof
+	public fun
+	0x2::groth16
+verify_groth16_proof_internal
+	fun
+	0x2::groth16
 SUI
 	public struct
 	0x2::sui
@@ -4096,6 +4264,9 @@ insert
 swap_remove
 	public fun
 	0x1::vector
+flatten
+	public fun
+	0x1::vector
 Option
 	public struct
 	0x1::option
@@ -4177,6 +4348,15 @@ pop_char
 length
 	public fun
 	0x1::ascii
+append
+	public fun
+	0x1::ascii
+insert
+	public fun
+	0x1::ascii
+substring
+	public fun
+	0x1::ascii
 as_bytes
 	public fun
 	0x1::ascii
@@ -4191,6 +4371,24 @@ is_valid_char
 	0x1::ascii
 is_printable_char
 	public fun
+	0x1::ascii
+is_empty
+	public fun
+	0x1::ascii
+to_uppercase
+	public fun
+	0x1::ascii
+to_lowercase
+	public fun
+	0x1::ascii
+index_of
+	public fun
+	0x1::ascii
+char_to_uppercase
+	fun
+	0x1::ascii
+char_to_lowercase
+	fun
 	0x1::ascii
 BitVector
 	public struct
@@ -4231,7 +4429,10 @@ to_ascii
 try_utf8
 	public fun
 	0x1::string
-bytes
+as_bytes
+	public fun
+	0x1::string
+into_bytes
 	public fun
 	0x1::string
 is_empty
@@ -4249,7 +4450,7 @@ append_utf8
 insert
 	public fun
 	0x1::string
-sub_string
+substring
 	public fun
 	0x1::string
 index_of
@@ -4266,6 +4467,12 @@ internal_sub_string
 	0x1::string
 internal_index_of
 	fun
+	0x1::string
+bytes
+	public fun
+	0x1::string
+sub_string
+	public fun
 	0x1::string
 length
 	public fun
@@ -4294,6 +4501,9 @@ get_module
 into_string
 	public fun
 	0x1::type_name
+bitwise_not
+	public fun
+	0x1::u128
 max
 	public fun
 	0x1::u128
@@ -4312,6 +4522,24 @@ pow
 sqrt
 	public fun
 	0x1::u128
+try_as_u8
+	public fun
+	0x1::u128
+try_as_u16
+	public fun
+	0x1::u128
+try_as_u32
+	public fun
+	0x1::u128
+try_as_u64
+	public fun
+	0x1::u128
+to_string
+	public fun
+	0x1::u128
+bitwise_not
+	public fun
+	0x1::u16
 max
 	public fun
 	0x1::u16
@@ -4330,6 +4558,15 @@ pow
 sqrt
 	public fun
 	0x1::u16
+try_as_u8
+	public fun
+	0x1::u16
+to_string
+	public fun
+	0x1::u16
+bitwise_not
+	public fun
+	0x1::u256
 max
 	public fun
 	0x1::u256
@@ -4345,6 +4582,27 @@ divide_and_round_up
 pow
 	public fun
 	0x1::u256
+try_as_u8
+	public fun
+	0x1::u256
+try_as_u16
+	public fun
+	0x1::u256
+try_as_u32
+	public fun
+	0x1::u256
+try_as_u64
+	public fun
+	0x1::u256
+try_as_u128
+	public fun
+	0x1::u256
+to_string
+	public fun
+	0x1::u256
+bitwise_not
+	public fun
+	0x1::u32
 max
 	public fun
 	0x1::u32
@@ -4363,6 +4621,18 @@ pow
 sqrt
 	public fun
 	0x1::u32
+try_as_u8
+	public fun
+	0x1::u32
+try_as_u16
+	public fun
+	0x1::u32
+to_string
+	public fun
+	0x1::u32
+bitwise_not
+	public fun
+	0x1::u64
 max
 	public fun
 	0x1::u64
@@ -4381,6 +4651,21 @@ pow
 sqrt
 	public fun
 	0x1::u64
+try_as_u8
+	public fun
+	0x1::u64
+try_as_u16
+	public fun
+	0x1::u64
+try_as_u32
+	public fun
+	0x1::u64
+to_string
+	public fun
+	0x1::u64
+bitwise_not
+	public fun
+	0x1::u8
 max
 	public fun
 	0x1::u8
@@ -4397,5 +4682,8 @@ pow
 	public fun
 	0x1::u8
 sqrt
+	public fun
+	0x1::u8
+to_string
 	public fun
 	0x1::u8

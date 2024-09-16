@@ -169,4 +169,112 @@ module std::option_tests {
         let v: vector<u64> = option::none().to_vec();
         assert!(v.is_empty());
     }
+
+    // === Macros ===
+
+    public struct NoDrop {}
+
+    #[test]
+    fun do_destroy() {
+        let mut counter = 0;
+        option::some(5).destroy!(|x| counter = x);
+        option::some(10).do!(|x| counter = counter + x);
+
+        assert!(counter == 15);
+
+        let some = option::some(NoDrop {});
+        let none = option::none<NoDrop>();
+
+        some.do!(|el| { let NoDrop {} = el; });
+        none.do!(|el| { let NoDrop {} = el; });
+    }
+
+    #[test]
+    fun do_ref_mut() {
+        let mut counter = 0;
+        let mut opt = option::some(5);
+        opt.do_mut!(|x| *x = 100);
+        opt.do_ref!(|x| counter = *x);
+
+        assert!(counter == 100);
+    }
+
+    #[test]
+    fun map_map_ref() {
+        assert!(option::some(5).map!(|x| vector[x]) == option::some(vector[5]));
+        assert!(option::some(5).map_ref!(|x| vector[*x]) == option::some(vector[5]));
+        assert!(option::none<u8>().map!(|x| vector[x]) == option::none());
+        assert!(option::none<u8>().map_ref!(|x| vector[*x]) == option::none());
+    }
+
+    #[test]
+    fun map_no_drop() {
+        let none = option::none<NoDrop>().map!(|el| {
+            let NoDrop {} = el;
+            100u64
+        });
+        let some = option::some(NoDrop {}).map!(|el| {
+            let NoDrop {} = el;
+            100u64
+        });
+
+        assert!(none == option::none());
+        assert!(some == option::some(100));
+    }
+
+    #[test]
+    fun or_no_drop() {
+        let none = option::none<NoDrop>().or!(option::some(NoDrop {}));
+        let some = option::some(NoDrop {}).or!(option::some(NoDrop {}));
+
+        assert!(none.is_some());
+        assert!(some.is_some());
+
+        let NoDrop {} = none.destroy_some();
+        let NoDrop {} = some.destroy_some();
+    }
+
+    #[test]
+    fun and_no_drop() {
+        let none = option::none<NoDrop>().and!(|e| {
+            let NoDrop {} = e;
+            option::some(100)
+        });
+
+        let some = option::some(NoDrop {}).and!(|e| {
+            let NoDrop {} = e;
+            option::some(100)
+        });
+
+        assert!(some == option::some(100));
+        assert!(none == option::none());
+    }
+
+    #[test]
+    fun filter() {
+        assert!(option::some(5).filter!(|x| *x == 5) == option::some(5));
+        assert!(option::some(5).filter!(|x| *x == 6) == option::none());
+    }
+
+    #[test]
+    fun is_some_and() {
+        assert!(option::some(5).is_some_and!(|x| *x == 5));
+        assert!(!option::some(5).is_some_and!(|x| *x == 6));
+        assert!(!option::none().is_some_and!(|x| *x == 5));
+    }
+
+    #[test]
+    fun destroy_or() {
+        assert!(option::none().destroy_or!(10) == 10);
+        assert!(option::some(5).destroy_or!(10) == 5);
+    }
+
+    #[test]
+    fun destroy_or_no_drop() {
+        let none = option::none<NoDrop>().destroy_or!(NoDrop {});
+        let some = option::some(NoDrop {}).destroy_or!(NoDrop {});
+
+        let NoDrop {} = some;
+        let NoDrop {} = none;
+    }
 }

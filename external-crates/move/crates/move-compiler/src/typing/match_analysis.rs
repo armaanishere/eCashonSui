@@ -17,7 +17,7 @@ use crate::{
     typing::{
         ast as T,
         core::{error_format, Context, Subst},
-        visitor::TypingVisitorContext,
+        visitor::TypingMutVisitorContext,
     },
 };
 use move_ir_types::location::*;
@@ -42,15 +42,16 @@ struct MatchCompiler<'ctx, 'env> {
     context: &'ctx mut Context<'env>,
 }
 
-impl TypingVisitorContext for MatchCompiler<'_, '_> {
+impl TypingMutVisitorContext for MatchCompiler<'_, '_> {
     fn visit_exp_custom(&mut self, exp: &mut T::Exp) -> bool {
         use T::UnannotatedExp_ as E;
+        let eloc = exp.exp.loc;
         if let E::Match(subject, arms) = &exp.exp.value {
             debug_print!(self.context.debug.match_counterexample,
                 ("subject" => subject),
                 (lines "arms" => &arms.value)
             );
-            if invalid_match(self.context, subject, arms) {
+            if invalid_match(self.context, eloc, subject, arms) {
                 debug_print!(
                     self.context.debug.match_counterexample,
                     (msg "counterexample found")
@@ -93,12 +94,13 @@ pub fn function_body_(context: &mut Context, b_: &mut T::FunctionBody_) {
 /// error.
 fn invalid_match(
     context: &mut Context,
+    loc: Loc,
     subject: &T::Exp,
     arms: &Spanned<Vec<T::MatchArm>>,
 ) -> bool {
     let arms_loc = arms.loc;
     let (pattern_matrix, _arms) =
-        PatternMatrix::from(context, subject.ty.clone(), arms.value.clone());
+        PatternMatrix::from(context, loc, subject.ty.clone(), arms.value.clone());
 
     let mut counterexample_matrix = pattern_matrix.clone();
     let has_guards = counterexample_matrix.has_guards();
@@ -371,7 +373,12 @@ fn find_counterexample_impl(
             // recur. If we don't, we check it as a default specialization.
             if let Some((ploc, arg_types)) = matrix.first_struct_ctors() {
                 let ctor_arity = arg_types.len() as u32;
-                let fringe_binders = context.make_imm_ref_match_binders(ploc, arg_types);
+                let decl_fields = context
+                    .modules
+                    .struct_fields(&mident, &datatype_name)
+                    .unwrap();
+                let fringe_binders =
+                    context.make_imm_ref_match_binders(decl_fields, ploc, arg_types);
                 let is_positional = context
                     .modules
                     .struct_is_positional(&mident, &datatype_name);
@@ -431,7 +438,12 @@ fn find_counterexample_impl(
             if unmatched_variants.is_empty() {
                 for (ctor, (ploc, arg_types)) in ctors {
                     let ctor_arity = arg_types.len() as u32;
-                    let fringe_binders = context.make_imm_ref_match_binders(ploc, arg_types);
+                    let decl_fields = context
+                        .modules
+                        .enum_variant_fields(&mident, &datatype_name, &ctor)
+                        .unwrap();
+                    let fringe_binders =
+                        context.make_imm_ref_match_binders(decl_fields, ploc, arg_types);
                     let is_positional =
                         context
                             .modules
@@ -547,9 +559,17 @@ fn find_counterexample_impl(
                     None
                 }
             }
-        } else {
-            assert!(matrix.is_empty());
+        } else if matrix.is_empty() {
             Some(make_wildcards(arity as usize))
+        } else {
+            // An error case: no entry on the fringe but no
+            if !context.env.has_errors() {
+                context.env.add_diag(ice!((
+                    matrix.loc,
+                    "Non-empty matrix with non errors but no type"
+                )));
+            }
+            None
         };
         debug_print!(context.debug.match_counterexample, (opt "result" => &result; sdbg));
         result
