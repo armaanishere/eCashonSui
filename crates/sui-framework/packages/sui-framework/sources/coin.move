@@ -41,6 +41,7 @@ module sui::coin {
         balance: Balance<T>
     }
 
+    #[allow(deprecated_usage)]
     /// Each Coin type T created through `create_currency` function will have a
     /// unique instance of CoinMetadata<T> that stores the metadata for this coin type.
     public struct CoinMetadata<phantom T> has key, store {
@@ -210,6 +211,7 @@ module sui::coin {
 
     // === Registering new coin types and managing the coin supply ===
 
+    #[allow(deprecated_usage)]
     /// Create a new currency type `T` as and return the `TreasuryCap` for
     /// `T` to the caller. Can only be called with a `one-time-witness`
     /// type, ensuring that there's only one `TreasuryCap` per `T`.
@@ -241,6 +243,7 @@ module sui::coin {
         )
     }
 
+    #[allow(deprecated_usage)]
     /// This creates a new currency, via `create_currency`, but with an extra capability that
     /// allows for specific addresses to have their coins frozen. When an address is added to the
     /// deny list, it is immediately unable to interact with the currency's coin as input objects.
@@ -452,6 +455,7 @@ module sui::coin {
         metadata.description = description;
     }
 
+    #[allow(deprecated_usage)]
     /// Update the url of the coin in `CoinMetadata`
     public entry fun update_icon_url<T>(
         _treasury: &TreasuryCap<T>, metadata: &mut CoinMetadata<T>, url: ascii::String
@@ -477,6 +481,7 @@ module sui::coin {
         metadata.description
     }
 
+    #[allow(deprecated_usage)]
     public fun get_icon_url<T>(metadata: &CoinMetadata<T>): Option<Url> {
         metadata.icon_url
     }
@@ -517,6 +522,7 @@ module sui::coin {
 
     // deprecated as we have CoinMetadata now
     #[allow(unused_field)]
+    #[deprecated(note = b"This event is deprecated in favor of `CoinMetadata`")]
     public struct CurrencyCreated<phantom T> has copy, drop {
         decimals: u8
     }
@@ -530,6 +536,7 @@ module sui::coin {
     /// This creates a new currency, via `create_currency`, but with an extra capability that
     /// allows for specific addresses to have their coins frozen. Those addresses cannot interact
     /// with the coin as input objects.
+    #[allow(deprecated_usage)]
     #[deprecated(note = b"For new coins, use `create_regulated_currency_v2`. To migrate existing regulated currencies, migrate with `migrate_regulated_currency_to_v2`")]
     public fun create_regulated_currency<T: drop>(
         witness: T,
