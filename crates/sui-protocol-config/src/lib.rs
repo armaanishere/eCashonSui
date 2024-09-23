@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 /// The minimum and maximum protocol versions supported by this build.
 const MIN_PROTOCOL_VERSION: u64 = 1;
-const MAX_PROTOCOL_VERSION: u64 = 60;
+const MAX_PROTOCOL_VERSION: u64 = 61;
 
 // Record history of protocol version allocations here:
 //
@@ -177,9 +177,9 @@ const MAX_PROTOCOL_VERSION: u64 = 60;
 // Version 58: Optimize boolean binops
 //             Finalize bridge committee on mainnet.
 //             Switch to distributed vote scoring in consensus in devnet
-// Version 59: Enable round prober in consensus.
-// Version 60: Validation of public inputs for Groth16 verification.
-//             Enable configuration of maximum number of type nodes in a type layout.
+// Version 59: Validation of public inputs for Groth16 verification.
+// Version 60: Enable configuration of maximum number of type nodes in a type layout.
+// Version 61: Enable epoch stable sequence number in effects for unsequenced config reads.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -534,6 +534,10 @@ struct FeatureFlags {
     // Validate identifier inputs separately
     #[serde(skip_serializing_if = "is_false")]
     validate_identifier_inputs: bool,
+
+    // Rethrow type layout errors during serialization instead of trying to convert them.
+    #[serde(skip_serializing_if = "is_false")]
+    include_epoch_stable_sequence_number_in_effects: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1602,6 +1606,11 @@ impl ProtocolConfig {
     }
     pub fn gc_depth(&self) -> u32 {
         self.consensus_gc_depth.unwrap_or(0)
+    }
+
+    pub fn include_epoch_stable_sequence_number_in_effects(&self) -> bool {
+        self.feature_flags
+            .include_epoch_stable_sequence_number_in_effects
     }
 }
 
@@ -2781,6 +2790,10 @@ impl ProtocolConfig {
                 60 => {
                     cfg.max_type_to_layout_nodes = Some(512);
                     cfg.feature_flags.validate_identifier_inputs = true;
+                }
+                61 => {
+                    cfg.feature_flags
+                        .include_epoch_stable_sequence_number_in_effects = true;
                 }
                 // Use this template when making changes:
                 //
