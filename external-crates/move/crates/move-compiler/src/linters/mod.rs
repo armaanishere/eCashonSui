@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub mod abort_constant;
+pub mod almost_swapped;
 pub mod constant_naming;
 pub mod loop_without_exit;
 pub mod meaningless_math_operation;
@@ -138,6 +139,12 @@ lints!(
         LinterDiagnosticCategory::Complexity,
         "unnecessary_conditional",
         "'if' expression can be removed"
+    ),
+    (
+        AlmostSwapped,
+        LinterDiagnosticCategory::Style,
+        "almost_swapped",
+        "unnecessary swap sequence detected"
     )
 );
 
@@ -173,6 +180,7 @@ pub fn linter_visitors(level: LintLevel) -> Vec<Visitor> {
                 abort_constant::AssertAbortNamedConstants.visitor(),
                 loop_without_exit::LoopWithoutExit.visitor(),
                 unnecessary_conditional::UnnecessaryConditional.visitor(),
+                almost_swapped::SwapSequence.visitor(),
             ]
         }
     }
