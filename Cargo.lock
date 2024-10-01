@@ -12896,6 +12896,7 @@ dependencies = [
  "shared-crypto",
  "sui-authority-aggregation",
  "sui-config",
+ "sui-core",
  "sui-json-rpc-api",
  "sui-json-rpc-types",
  "sui-keys",
