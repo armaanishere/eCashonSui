@@ -9,19 +9,25 @@ use move_bytecode_utils::module_cache::GetModule;
 use move_command_line_common::files::MOVE_COMPILED_EXTENSION;
 use move_core_types::{
     account_address::AccountAddress,
-    identifier::Identifier,
-    language_storage::{ModuleId, StructTag},
-    resolver::{LinkageResolver, ModuleResolver, ResourceResolver},
+    identifier::{IdentStr, Identifier},
+    language_storage::ModuleId,
+    resolver::{ModuleResolver, SerializedPackage, TypeOrigin},
 };
 use move_disassembler::disassembler::Disassembler;
 use move_ir_types::location::Spanned;
+use move_vm_runtime::shared::{
+    linkage_context::LinkageContext,
+    types::{PackageStorageId, RuntimePackageId},
+};
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
 
-/// subdirectory of `DEFAULT_STORAGE_DIR`/<addr> where modules are stored
-pub const MODULES_DIR: &str = "modules";
+/// subdirectory of `DEFAULT_STORAGE_DIR`/<addr> where packages are stored
+pub const PACKAGES_DIR: &str = "package";
 
 /// file under `DEFAULT_BUILD_DIR` where a registry of generated struct layouts are stored
 pub const STRUCT_LAYOUTS_FILE: &str = "struct_layouts.yaml";
@@ -32,8 +38,15 @@ pub struct OnDiskStateView {
     storage_dir: PathBuf,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PackageInfo {
+    storage_id: PackageStorageId,
+    linkage_table: BTreeMap<RuntimePackageId, PackageStorageId>,
+    type_origin_table: BTreeMap<Identifier, BTreeMap<Identifier, AccountAddress>>,
+}
+
 impl OnDiskStateView {
-    /// Create an `OnDiskStateView` that reads/writes resource data and modules in `storage_dir`.
+    /// Create an `OnDiskStateView` that reads/writes resource data and packages in `storage_dir`.
     pub fn create<P: Into<PathBuf>>(build_dir: P, storage_dir: P) -> Result<Self> {
         let build_dir = build_dir.into();
         if !build_dir.exists() {
@@ -73,26 +86,43 @@ impl OnDiskStateView {
             }
     }
 
-    pub fn is_module_path(&self, p: &Path) -> bool {
-        self.is_data_path(p, MODULES_DIR)
+    pub fn is_package_path(&self, p: &Path) -> bool {
+        self.is_data_path(p, PACKAGES_DIR)
     }
 
-    fn get_addr_path(&self, addr: &AccountAddress) -> PathBuf {
+    fn get_package_path(&self, addr: &PackageStorageId) -> PathBuf {
         let mut path = self.storage_dir.clone();
         path.push(format!("0x{}", addr));
+        path.push(PACKAGES_DIR);
         path
     }
 
-    fn get_module_path(&self, module_id: &ModuleId) -> PathBuf {
-        let mut path = self.get_addr_path(module_id.address());
-        path.push(MODULES_DIR);
-        path.push(module_id.name().to_string());
+    pub fn storage_id_of_path(&self, p: &Path) -> Option<PackageStorageId> {
+        if !p.exists() {
+            return None;
+        }
+
+        p.parent()
+            .and_then(|p| p.file_stem())
+            .and_then(|a| a.to_str())
+            .and_then(|a| AccountAddress::from_hex_literal(a).ok())
+    }
+
+    fn get_module_path(&self, package_id: &PackageStorageId, module_name: &IdentStr) -> PathBuf {
+        let mut path = self.get_package_path(package_id);
+        path.push(module_name.as_str());
         path.with_extension(MOVE_COMPILED_EXTENSION)
+    }
+
+    fn get_metadata_path(&self, package_id: &PackageStorageId) -> PathBuf {
+        let mut path = self.get_package_path(package_id);
+        path.push("package_metadata.yaml");
+        path
     }
 
     /// Extract a module ID from a path
     pub fn get_module_id(&self, p: &Path) -> Option<ModuleId> {
-        if !self.is_module_path(p) {
+        if !self.is_package_path(p) {
             return None;
         }
         let name = Identifier::new(p.file_stem().unwrap().to_str().unwrap()).unwrap();
@@ -107,36 +137,69 @@ impl OnDiskStateView {
         }
     }
 
-    /// Read the resource bytes stored on-disk at `addr`/`tag`
-    fn get_module_bytes(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>> {
-        Self::get_bytes(&self.get_module_path(module_id))
-    }
-
-    /// Read the package bytes stored on-disk at `addr`
-    fn get_package_bytes(&self, address: &AccountAddress) -> Result<Option<Vec<Vec<u8>>>> {
-        let addr_path = self.get_addr_path(address);
-        if !addr_path.exists() {
+    fn get_package_at_path(&self, path: &Path) -> Result<Option<SerializedPackage>> {
+        if !path.exists() {
             return Ok(None);
         }
         let mut modules = vec![];
-        for entry in fs::read_dir(addr_path)? {
+        for entry in fs::read_dir(path)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() {
+            if path.is_file() && path.extension().unwrap() == MOVE_COMPILED_EXTENSION {
                 modules.push(Self::get_bytes(&path)?.unwrap());
             }
         }
-        Ok(Some(modules))
+        let package_id = self.storage_id_of_path(path).unwrap();
+        let metadata_path = self.get_metadata_path(&package_id);
+        let metadata = Self::get_bytes(&metadata_path)?.unwrap();
+        let info: PackageInfo = serde_yaml::from_slice(&metadata)?;
+        let mut type_origin_table = vec![];
+        for (module_name, type_map) in info.type_origin_table {
+            for (type_name, origin_id) in type_map {
+                type_origin_table.push(TypeOrigin {
+                    module_name: module_name.clone(),
+                    type_name,
+                    origin_id,
+                });
+            }
+        }
+        let pkg = SerializedPackage {
+            modules,
+            storage_id: info.storage_id,
+            linkage_table: info.linkage_table,
+            type_origin_table,
+        };
+        Ok(Some(pkg))
+    }
+
+    /// Read the package bytes stored on-disk at `addr`
+    fn get_package(&self, address: &PackageStorageId) -> Result<Option<SerializedPackage>> {
+        let addr_path = self.get_package_path(address);
+        self.get_package_at_path(&addr_path)
+    }
+
+    pub fn has_package(&self, package_id: &PackageStorageId) -> bool {
+        self.get_package_path(package_id).exists()
     }
 
     /// Check if a module at `addr`/`module_id` exists
-    pub fn has_module(&self, module_id: &ModuleId) -> bool {
-        self.get_module_path(module_id).exists()
+    pub fn has_module_in_package(
+        &self,
+        package_id: &PackageStorageId,
+        module_name: &IdentStr,
+    ) -> bool {
+        self.get_module_path(package_id, module_name).exists()
     }
 
     /// Return the name of the function at `idx` in `module_id`
-    pub fn resolve_function(&self, module_id: &ModuleId, idx: u16) -> Result<Option<Identifier>> {
-        if let Some(m) = self.get_module_by_id(module_id)? {
+    pub fn resolve_function(
+        &self,
+        package_id: PackageStorageId,
+        module_name: &IdentStr,
+        idx: u16,
+    ) -> Result<Option<Identifier>> {
+        let module_id = ModuleId::new(package_id, module_name.to_owned());
+        if let Some(m) = self.get_module_by_id(&module_id)? {
             Ok(Some(
                 m.identifier_at(
                     m.function_handle_at(m.function_def_at(FunctionDefinitionIndex(idx)).function)
@@ -179,15 +242,6 @@ impl OnDiskStateView {
         Self::view_bytecode(module_path)
     }
 
-    /// Save `module` on disk under the path `module.address()`/`module.name()`
-    pub fn save_module(&self, module_id: &ModuleId, module_bytes: &[u8]) -> Result<()> {
-        let path = self.get_module_path(module_id);
-        if !path.exists() {
-            fs::create_dir_all(path.parent().unwrap())?
-        }
-        Ok(fs::write(path, module_bytes)?)
-    }
-
     /// Save the YAML encoding `layout` on disk under `build_dir/layouts/id`.
     pub fn save_struct_layouts(&self, layouts: &str) -> Result<()> {
         let layouts_file = self.struct_layouts_file();
@@ -198,25 +252,42 @@ impl OnDiskStateView {
     }
 
     /// Save all the modules in the local cache, re-generate mv_interfaces if required.
-    pub fn save_modules<'a>(
-        &self,
-        modules: impl IntoIterator<Item = &'a (ModuleId, Vec<u8>)>,
-    ) -> Result<()> {
-        for (module_id, module_bytes) in modules {
-            self.save_module(module_id, module_bytes)?;
+    pub fn save_package(&self, package: SerializedPackage) -> Result<()> {
+        let pkg_id = package.storage_id;
+        let pkg_path = self.get_package_path(&pkg_id);
+        if !pkg_path.exists() {
+            fs::create_dir_all(&pkg_path)?;
         }
-        Ok(())
-    }
 
-    pub fn delete_module(&self, id: &ModuleId) -> Result<()> {
-        let path = self.get_module_path(id);
-        fs::remove_file(path)?;
-
-        // delete addr directory if this address is now empty
-        let addr_path = self.get_addr_path(id.address());
-        if addr_path.read_dir()?.next().is_none() {
-            fs::remove_dir(addr_path)?
+        for m_bytes in package.modules {
+            let module = CompiledModule::deserialize_with_defaults(&m_bytes)?;
+            let module_id = module.self_id();
+            let m_path = self.get_module_path(&pkg_id, module_id.name());
+            if !m_path.exists() {
+                fs::create_dir_all(m_path.parent().unwrap())?
+            }
+            fs::write(m_path, m_bytes)?
         }
+        let mut type_origin_table = BTreeMap::new();
+        for TypeOrigin {
+            module_name,
+            type_name,
+            origin_id,
+        } in package.type_origin_table
+        {
+            let entry = type_origin_table
+                .entry(module_name)
+                .or_insert_with(BTreeMap::new);
+            entry.insert(type_name, origin_id);
+        }
+        let info = PackageInfo {
+            storage_id: pkg_id,
+            linkage_table: package.linkage_table,
+            type_origin_table,
+        };
+
+        let metadata_path = self.get_metadata_path(&pkg_id);
+        fs::write(metadata_path, serde_yaml::to_string(&info)?)?;
         Ok(())
     }
 
@@ -232,69 +303,143 @@ impl OnDiskStateView {
             .filter(move |path| f(path))
     }
 
-    pub fn module_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
-        self.iter_paths(move |p| self.is_module_path(p))
+    pub fn package_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.iter_paths(move |p| self.is_package_path(p))
     }
 
     /// Build all modules in the self.storage_dir.
     /// Returns an Err if a module does not deserialize.
-    pub fn get_all_modules(&self) -> Result<Vec<CompiledModule>> {
-        self.module_paths()
+    pub fn get_all_packages(&self) -> Result<BTreeMap<PackageStorageId, SerializedPackage>> {
+        self.package_paths()
             .map(|path| {
-                CompiledModule::deserialize_with_defaults(&Self::get_bytes(&path)?.unwrap())
+                let package_id = self.storage_id_of_path(&path).unwrap();
+                let pkg = self.get_package_at_path(&path)?.unwrap();
+                Ok((package_id, pkg))
+            })
+            .collect::<Result<_>>()
+    }
+
+    /// Get the compiled modules for a given package.
+    pub fn get_compiled_modules(
+        &self,
+        package_address: &AccountAddress,
+    ) -> Result<Vec<CompiledModule>> {
+        let Some(package_bytes) = self.get_package(package_address)? else {
+            return Err(anyhow!("No package fount at {package_address}"));
+        };
+        package_bytes
+            .modules
+            .into_iter()
+            .map(|module| {
+                CompiledModule::deserialize_with_defaults(&module)
                     .map_err(|e| anyhow!("Failed to deserialized module: {:?}", e))
             })
             .collect::<Result<Vec<CompiledModule>>>()
     }
-}
 
-/// Default implementation of LinkageResolver (no re-linking).
-impl LinkageResolver for OnDiskStateView {
-    type Error = anyhow::Error;
-
-    fn link_context(&self) -> AccountAddress {
-        todo!("VM rewrite")
-    }
-
-    fn relocate(&self, module_id: &ModuleId) -> std::result::Result<ModuleId, Self::Error> {
-        todo!("VM rewrite")
-    }
-
-    fn defining_module(
+    /// Compute all of the transitive dependencies for a `root_package`, including itself.
+    pub fn transitive_dependencies(
         &self,
-        module_id: &ModuleId,
-        _struct: &move_core_types::identifier::IdentStr,
-    ) -> std::result::Result<ModuleId, Self::Error> {
-        todo!("VM rewrite")
+        root_package: &AccountAddress,
+    ) -> Result<BTreeSet<AccountAddress>> {
+        let mut seen: BTreeSet<AccountAddress> = BTreeSet::new();
+        let mut to_process: Vec<AccountAddress> = vec![*root_package];
+
+        while let Some(package_id) = to_process.pop() {
+            // If we've already processed this package, skip it
+            if seen.contains(&package_id) {
+                continue;
+            }
+
+            // Add the current package to the seen set
+            seen.insert(package_id);
+
+            // Attempt to retrieve the package's modules from the store
+            let Ok([Some(pkg)]) = self.get_packages_static([package_id]) else {
+                return Err(anyhow!(
+                    "Cannot find {:?} in data cache when building linkage context",
+                    package_id
+                ));
+            };
+
+            // Process each module and add its dependencies to the to_process list
+            for module in &pkg.modules {
+                let module = CompiledModule::deserialize_with_defaults(module).unwrap();
+                let deps = module
+                    .immediate_dependencies()
+                    .into_iter()
+                    .map(|module| *module.address());
+
+                // Add unprocessed dependencies to the queue
+                for dep in deps {
+                    if !seen.contains(&dep) {
+                        to_process.push(dep);
+                    }
+                }
+            }
+        }
+
+        Ok(seen)
     }
 
-    fn all_package_dependencies(
+    /// Generates a reflective link context (that is, all addresses map to themselves) by
+    /// collecting the modules and transitive dependencies from the specified address.
+    pub fn generate_linkage_context(
         &self,
-    ) -> std::result::Result<std::collections::BTreeSet<AccountAddress>, Self::Error> {
-        todo!("VM rewrite")
+        package_address: &AccountAddress,
+    ) -> Result<LinkageContext> {
+        let modules = self.get_compiled_modules(package_address)?;
+        let mut all_dependencies: BTreeSet<AccountAddress> = BTreeSet::new();
+        for module in modules {
+            for dep in module
+                .immediate_dependencies()
+                .iter()
+                .map(|dep| dep.address())
+                .filter(|dep| *dep != package_address)
+            {
+                // If this dependency is in here, its transitive dependencies are, too.
+                if all_dependencies.contains(dep) {
+                    continue;
+                }
+                let new_dependencies = self.transitive_dependencies(dep)?;
+                all_dependencies.extend(new_dependencies.into_iter());
+            }
+        }
+        // Consider making tehse into VM errors on failure instead.
+        assert!(
+            !all_dependencies.remove(package_address),
+            "Found circular dependencies during dependency generation."
+        );
+        let linkage_context = LinkageContext::new(
+            *package_address,
+            all_dependencies
+                .into_iter()
+                .map(|id| (id, id))
+                .chain(vec![(*package_address, *package_address)])
+                .collect(),
+        );
+        Ok(linkage_context)
     }
 }
 
 impl ModuleResolver for OnDiskStateView {
     type Error = anyhow::Error;
-    fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.get_module_bytes(module_id)
-    }
-
-    fn get_package(&self, id: &AccountAddress) -> Result<Option<Vec<Vec<u8>>>, Self::Error> {
-        self.get_package_bytes(id)
-    }
-}
-
-impl ResourceResolver for OnDiskStateView {
-    type Error = anyhow::Error;
-
-    fn get_resource(
+    fn get_packages_static<const N: usize>(
         &self,
-        _address: &AccountAddress,
-        _struct_tag: &StructTag,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
-        unimplemented!()
+        ids: [AccountAddress; N],
+    ) -> Result<[Option<SerializedPackage>; N], Self::Error> {
+        let mut packages = [(); N].map(|_| None);
+        for (i, id) in ids.iter().enumerate() {
+            packages[i] = self.get_package(id)?;
+        }
+        Ok(packages)
+    }
+
+    fn get_packages(
+        &self,
+        ids: &[AccountAddress],
+    ) -> Result<Vec<Option<SerializedPackage>>, Self::Error> {
+        ids.iter().map(|id| self.get_package(id)).collect()
     }
 }
 
