@@ -1,0 +1,9 @@
+[package]
+name = "nft_display"
+edition = "2024.beta"
+
+[dependencies]
+Sui = { local = "../../../crates/sui-framework/packages/sui-framework" }
+
+[addresses]
+metal = "0x0"
