@@ -10,8 +10,9 @@ use std::{
 
 use arc_swap::ArcSwap;
 use consensus_config::Committee as ConsensusCommittee;
-use consensus_core::{CommitConsumerMonitor, TransactionIndex, VerifiedBlock};
+use consensus_core::{BlockRef, BlockStatus, CommitConsumerMonitor, TransactionsOutput};
 use lru::LruCache;
+use mysten_common::sync::notify_read::{NotifyRead, RegistrationOwned};
 use mysten_metrics::{
     monitored_future,
     monitored_mpsc::{self, UnboundedReceiver},
@@ -474,13 +475,48 @@ pub(crate) struct MysticetiConsensusHandler {
     tasks: JoinSet<()>,
 }
 
+#[derive(Clone)]
+pub enum TerminalBlockStatus {
+    Sequenced { rejected: bool },
+    GarbageCollected { rejected: bool },
+}
+
+/// Subscriber to receive updates regarding the status of the blocks for submitted transactions.
+/// When a block is sequenced or garbage collected, the subscriber is notified.
+#[derive(Default)]
+pub struct TerminalBlockStatusNotifier {
+    subscriptions: Arc<NotifyRead<(BlockRef, ConsensusTransactionKey), TerminalBlockStatus>>,
+}
+
+impl TerminalBlockStatusNotifier {
+    pub fn subscribe(
+        &self,
+        block_ref: BlockRef,
+        transaction_key: ConsensusTransactionKey,
+    ) -> RegistrationOwned<(BlockRef, ConsensusTransactionKey), TerminalBlockStatus> {
+        self.subscriptions
+            .register_one_owned(&(block_ref, transaction_key))
+    }
+
+    pub fn notify(
+        &self,
+        block_ref: BlockRef,
+        transaction_key: ConsensusTransactionKey,
+        status: TerminalBlockStatus,
+    ) -> usize {
+        self.subscriptions
+            .notify(&(block_ref, transaction_key), &status)
+    }
+}
+
 impl MysticetiConsensusHandler {
     pub(crate) fn new(
         mut consensus_handler: ConsensusHandler<CheckpointService>,
         consensus_transaction_handler: ConsensusTransactionHandler,
         mut commit_receiver: UnboundedReceiver<consensus_core::CommittedSubDag>,
-        mut transaction_receiver: UnboundedReceiver<Vec<(VerifiedBlock, Vec<TransactionIndex>)>>,
+        mut transaction_receiver: UnboundedReceiver<TransactionsOutput>,
         commit_consumer_monitor: Arc<CommitConsumerMonitor>,
+        block_status_notifier: Arc<TerminalBlockStatusNotifier>,
     ) -> Self {
         let mut tasks = JoinSet::new();
         tasks.spawn(monitored_future!(async move {
@@ -495,17 +531,54 @@ impl MysticetiConsensusHandler {
         }));
         if consensus_transaction_handler.enabled() {
             tasks.spawn(monitored_future!(async move {
-                while let Some(blocks_and_rejected_transactions) = transaction_receiver.recv().await
-                {
-                    let parsed_transactions = blocks_and_rejected_transactions
-                        .into_iter()
-                        .flat_map(|(block, rejected_transactions)| {
-                            parse_block_transactions(&block, &rejected_transactions)
-                        })
-                        .collect::<Vec<_>>();
-                    consensus_transaction_handler
-                        .handle_consensus_transactions(parsed_transactions)
-                        .await;
+                while let Some(transactions) = transaction_receiver.recv().await {
+                    match transactions.status {
+                        BlockStatus::Certified => {
+                            let parsed_transactions = transactions
+                                .blocks_and_rejected_transactions
+                                .into_iter()
+                                .flat_map(|(block, rejected_transactions)| {
+                                    parse_block_transactions(&block, &rejected_transactions)
+                                })
+                                .collect::<Vec<_>>();
+                            consensus_transaction_handler
+                                .handle_consensus_transactions(parsed_transactions)
+                                .await;
+                        }
+                        status @ (BlockStatus::Sequenced | BlockStatus::GarbageCollected) => {
+                            let parsed_transactions = transactions
+                                .blocks_and_rejected_transactions
+                                .into_iter()
+                                .map(|(block, rejected_transactions)| {
+                                    (
+                                        block.reference(),
+                                        parse_block_transactions(&block, &rejected_transactions),
+                                    )
+                                })
+                                .collect::<Vec<(BlockRef, Vec<ParsedTransaction>)>>();
+
+                            for (block_ref, transactions) in parsed_transactions {
+                                for tx in transactions {
+                                    let s = match status {
+                                        BlockStatus::Sequenced => TerminalBlockStatus::Sequenced {
+                                            rejected: tx.rejected,
+                                        },
+                                        BlockStatus::GarbageCollected => {
+                                            TerminalBlockStatus::GarbageCollected {
+                                                rejected: tx.rejected,
+                                            }
+                                        }
+                                        _ => panic!("Unexpected block status"),
+                                    };
+                                    block_status_notifier.notify(
+                                        block_ref,
+                                        tx.transaction.key(),
+                                        s,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }));
         }
@@ -958,7 +1031,8 @@ impl ConsensusTransactionHandler {
 #[cfg(test)]
 mod tests {
     use consensus_core::{
-        BlockAPI, CommitDigest, CommitRef, CommittedSubDag, TestBlock, Transaction, VerifiedBlock,
+        BlockAPI, CommitDigest, CommitRef, CommittedSubDag, TestBlock, Transaction,
+        TransactionIndex, VerifiedBlock,
     };
     use prometheus::Registry;
     use sui_protocol_config::ConsensusTransactionOrdering;

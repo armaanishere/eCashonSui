@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::authority::test_authority_builder::TestAuthorityBuilder;
-use crate::consensus_adapter::{BlockStatus, SubmitResponse};
+use crate::consensus_adapter::SubmitResponse;
+use crate::consensus_handler::TerminalBlockStatus;
 use fastcrypto::{ed25519::Ed25519KeyPair, traits::KeyPair};
 use fastcrypto_zkp::bn254::zk_login::{parse_jwks, OIDCProvider, ZkLoginInputs};
 use move_core_types::ident_str;
@@ -1682,7 +1683,9 @@ async fn test_handle_soft_bundle_certificates() {
         authority.clone(),
         HashSet::new(),
         true,
-        vec![SubmitResponse::NoStatusWaiter(BlockStatus::Sequenced)],
+        vec![SubmitResponse::NoStatusWaiter(vec![
+            TerminalBlockStatus::Sequenced { rejected: false },
+        ])],
     );
     let server = AuthorityServer::new_for_test_with_consensus_adapter(authority.clone(), adapter);
     let _metrics = server.metrics.clone();
