@@ -1908,6 +1908,7 @@ impl AuthorityState {
             .expect("Creating an executor should not fail here");
 
         let expensive_checks = false;
+        let skip_all_checks = false;
         let (inner_temp_store, _, effects, _execution_error) = executor.dev_inspect_transaction(
             self.get_backing_store().as_ref(),
             protocol_config,
@@ -1925,7 +1926,7 @@ impl AuthorityState {
             kind,
             signer,
             transaction_digest,
-            false,
+            skip_all_checks,
         );
         let tx_digest = *effects.transaction_digest();
 
