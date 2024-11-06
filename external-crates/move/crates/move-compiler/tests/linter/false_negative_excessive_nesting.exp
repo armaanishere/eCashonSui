@@ -1,0 +1,17 @@
+warning[Lint W01011]: detected excessive block nesting. Consider refactoring to simplify the code.
+   ┌─ tests/linter/false_negative_excessive_nesting.move:5:17
+   │    
+ 5 │             let y = if (x > 0) {
+   │ ╭───────────────────^
+   │ │ ╭─────────────────'
+ 6 │ │ │             if (x > 10) {
+ 7 │ │ │                 if (x > 20) {
+ 8 │ │ │                     if (x > 30) { // Nested in let binding
+   · │ │
+12 │ │ │             } else { x }
+13 │ │ │         } else { x };
+   │ ╰─│────────────────────^ Nesting level of 4 exceeds maximum allowed (3)
+   │   ╰────────────────────' Consider refactoring to reduce nesting
+   │    
+   = This warning can be suppressed with '#[allow(lint(excessive_nesting))]' applied to the 'module' or module member ('const', 'fun', or 'struct')
+
