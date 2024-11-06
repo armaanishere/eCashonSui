@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::info;
 
 pub(crate) async fn reduce<W: Worker>(
     task_name: String,
@@ -39,6 +40,7 @@ pub(crate) async fn reduce<W: Worker>(
             }
             current_checkpoint_number += 1;
         }
+        info!("reducer batch size {}", batch.len());
         match reducer {
             Some(ref reducer) => {
                 if reducer.should_close_batch(&batch, None) {
