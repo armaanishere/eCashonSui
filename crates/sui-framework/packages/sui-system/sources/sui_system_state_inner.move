@@ -1127,6 +1127,11 @@ module sui_system::sui_system_state_inner {
     }
 
     #[test_only]
+    public(package) fun increment_epoch_for_testing(self: &mut SuiSystemStateInnerV2) {
+        self.epoch = self.epoch + 1
+    }
+
+    #[test_only]
     public(package) fun request_add_validator_for_testing(
         self: &mut SuiSystemStateInnerV2,
         min_joining_stake_for_testing: u64,
