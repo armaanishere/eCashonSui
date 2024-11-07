@@ -3,11 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
+use clap::Parser;
 use fastcrypto::traits::ToFromBytes;
 use futures::future::join_all;
 use futures::future::AbortHandle;
 use itertools::Itertools;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -71,6 +73,13 @@ use typed_store::rocks::MetricConf;
 
 pub mod commands;
 pub mod db_tool;
+
+#[derive(Parser, Clone, ValueEnum)]
+pub enum Verbosity {
+    Grouped,
+    Concise,
+    Verbose,
+}
 
 #[derive(
     Clone, Serialize, Deserialize, Debug, PartialEq, Copy, PartialOrd, Ord, Eq, ValueEnum, Default,
@@ -150,6 +159,7 @@ where
 pub struct GroupedObjectOutput {
     pub grouped_results: BTreeMap<
         Option<(
+            ObjectID,
             Option<SequenceNumber>,
             ObjectDigest,
             TransactionDigest,
@@ -160,6 +170,7 @@ pub struct GroupedObjectOutput {
     >,
     pub voting_power: Vec<(
         Option<(
+            ObjectID,
             Option<SequenceNumber>,
             ObjectDigest,
             TransactionDigest,
@@ -170,12 +181,14 @@ pub struct GroupedObjectOutput {
     )>,
     pub available_voting_power: u64,
     pub fully_locked: bool,
+    pub ignore_error: bool,
 }
 
 impl GroupedObjectOutput {
     pub fn new(
         object_data: ObjectData,
         committee: Arc<BTreeMap<AuthorityPublicKeyBytes, u64>>,
+        ignore_error: bool,
     ) -> Self {
         let mut grouped_results = BTreeMap::new();
         let mut voting_power = BTreeMap::new();
@@ -184,6 +197,7 @@ impl GroupedObjectOutput {
             let stake = committee.get(name).unwrap();
             let key = match resp {
                 Ok(r) => {
+                    let obj_id = r.object.id();
                     let obj_digest = r.object.compute_object_reference().2;
                     let parent_tx_digest = r.object.previous_transaction;
                     let owner = r.object.owner;
@@ -191,7 +205,7 @@ impl GroupedObjectOutput {
                     if lock.is_none() {
                         available_voting_power += stake;
                     }
-                    Some((*version, obj_digest, parent_tx_digest, owner, lock))
+                    Some((obj_id, *version, obj_digest, parent_tx_digest, owner, lock))
                 }
                 Err(_) => None,
             };
@@ -215,6 +229,7 @@ impl GroupedObjectOutput {
             voting_power,
             available_voting_power,
             fully_locked,
+            ignore_error,
         }
     }
 }
@@ -229,20 +244,24 @@ impl std::fmt::Display for GroupedObjectOutput {
             let val = self.grouped_results.get(key).unwrap();
             writeln!(f, "total stake: {stake}")?;
             match key {
-                Some((_version, obj_digest, parent_tx_digest, owner, lock)) => {
+                Some((obj_id, _version, obj_digest, parent_tx_digest, owner, lock)) => {
                     let lock = lock.opt_debug("no-known-lock");
-                    writeln!(f, "obj ref: {obj_digest}")?;
+                    writeln!(f, "obj ID: {obj_id}")?;
+                    writeln!(f, "obj digest: {obj_digest}")?;
                     writeln!(f, "parent tx: {parent_tx_digest}")?;
                     writeln!(f, "owner: {owner}")?;
                     writeln!(f, "lock: {lock}")?;
                     for (i, name) in val.iter().enumerate() {
-                        writeln!(f, "        {:<4} {:<20}", i, name.concise(),)?;
+                        writeln!(f, "        {:<4} {:<20}", i, name,)?;
                     }
                 }
                 None => {
+                    if self.ignore_error {
+                        continue;
+                    }
                     writeln!(f, "ERROR")?;
                     for (i, name) in val.iter().enumerate() {
-                        writeln!(f, "        {:<4} {:<20}", i, name.concise(),)?;
+                        writeln!(f, "        {:<4} {:<20}", i, name,)?;
                     }
                 }
             };
@@ -269,7 +288,7 @@ impl std::fmt::Display for ConciseObjectOutput {
             write!(
                 f,
                 "{:<20} {:<8}",
-                format!("{:?}", name.concise()),
+                format!("{:?}", name),
                 version.map(|s| s.value()).opt_debug("-")
             )?;
             match resp {
@@ -298,7 +317,7 @@ impl std::fmt::Display for VerboseObjectOutput {
         writeln!(f, "Object: {}", self.0.requested_id)?;
 
         for (name, multiaddr, (version, resp, timespent)) in &self.0.responses {
-            writeln!(f, "validator: {:?}, addr: {:?}", name.concise(), multiaddr)?;
+            writeln!(f, "validator: {:?}, addr: {:?}", name, multiaddr)?;
             writeln!(
                 f,
                 "-- version: {} ({:.3}s)",
@@ -461,7 +480,7 @@ pub async fn get_transaction_block(
                 &mut s,
                 "        {:<4} {:<20} {:<56} ({:.3}s)",
                 j,
-                res.0.concise(),
+                res.0,
                 format!("{}", res.1),
                 res.3
             )?;
@@ -818,6 +837,77 @@ pub async fn check_completed_snapshot(
             success_marker
         ))
     }
+}
+
+pub async fn get_dead_genesis_objects(db_path: &Path, genesis: &Path) -> Result<(), anyhow::Error> {
+    let mut genesis_object_ids: HashSet<ObjectID> = Genesis::load(genesis)?
+        .objects()
+        .iter()
+        .map(|obj| obj.id())
+        .collect();
+    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(
+        &db_path.join("live").join("store"),
+        None,
+    ));
+    let live_objects = perpetual_db.iter_live_object_set(false);
+    live_objects.for_each(|obj| {
+        let oid = obj.object_id();
+        if genesis_object_ids.contains(&oid) {
+            genesis_object_ids.remove(&oid);
+        }
+    });
+    println!(
+        "Found {} dead genesis objects: \n{}",
+        genesis_object_ids.len(),
+        genesis_object_ids
+            .iter()
+            .map(|oid| format!("{:?}", oid))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    Ok(())
+}
+
+pub async fn fetch_object(
+    id: ObjectID,
+    version: Option<u64>,
+    validator: Option<AuthorityName>,
+    fullnode_rpc_url: String,
+    verbosity: Verbosity,
+    concise_no_header: bool,
+    ignore_error: bool,
+) -> Result<(), anyhow::Error> {
+    let sui_client = Arc::new(SuiClientBuilder::default().build(fullnode_rpc_url).await?);
+    let clients = Arc::new(make_clients(&sui_client).await?);
+    let output = get_object(id, version, validator, clients).await?;
+
+    match verbosity {
+        Verbosity::Grouped => {
+            let committee = Arc::new(
+                sui_client
+                    .governance_api()
+                    .get_committee_info(None)
+                    .await?
+                    .validators
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>(),
+            );
+            println!(
+                "{}",
+                GroupedObjectOutput::new(output, committee, ignore_error)
+            );
+        }
+        Verbosity::Verbose => {
+            println!("{}", VerboseObjectOutput(output));
+        }
+        Verbosity::Concise => {
+            if !concise_no_header {
+                println!("{}", ConciseObjectOutput::header());
+            }
+            println!("{}", ConciseObjectOutput(output));
+        }
+    }
+    Ok(())
 }
 
 pub async fn download_formal_snapshot(
