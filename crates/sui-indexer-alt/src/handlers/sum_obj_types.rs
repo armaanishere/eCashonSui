@@ -22,13 +22,6 @@ use crate::{
     schema::sum_obj_types,
 };
 
-/// Each insert or update will include at most this many rows -- the size is chosen to maximize the
-/// rows without hitting the limit on bind parameters.
-const UPDATE_CHUNK_ROWS: usize = i16::MAX as usize / 8;
-
-/// Each deletion will include at most this many rows.
-const DELETE_CHUNK_ROWS: usize = i16::MAX as usize;
-
 pub struct SumObjTypes;
 
 impl Processor for SumObjTypes {
@@ -156,7 +149,7 @@ impl Handler for SumObjTypes {
             }
         }
 
-        let update_chunks = updates.chunks(UPDATE_CHUNK_ROWS).map(|chunk| {
+        let update_chunks = updates.chunks(Self::INSERT_CHUNK_ROWS).map(|chunk| {
             diesel::insert_into(sum_obj_types::table)
                 .values(chunk)
                 .on_conflict(sum_obj_types::object_id)
@@ -171,7 +164,7 @@ impl Handler for SumObjTypes {
 
         let updated: usize = try_join_all(update_chunks).await?.into_iter().sum();
 
-        let delete_chunks = deletes.chunks(DELETE_CHUNK_ROWS).map(|chunk| {
+        let delete_chunks = deletes.chunks(Self::DELETE_CHUNK_ROWS).map(|chunk| {
             diesel::delete(sum_obj_types::table)
                 .filter(sum_obj_types::object_id.eq_any(chunk.iter().cloned()))
                 .execute(conn)
