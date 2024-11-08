@@ -23,7 +23,7 @@ jobs:
         run: echo "hasChanges=$(pnpm list --filter "...[$(git rev-parse HEAD^1)]" --depth -1 --json | jq "any(.[] | select(.private != true) ; length > 0)")" >> $GITHUB_OUTPUT
       - name: Get changed files in the changesets folder
         id: has-changesets
-        uses: tj-actions/changed-files@0874344d6ebbaa00a27da73276ae7162fadcaf69 # pin@v44.3.0
+        uses: tj-actions/changed-files@4edd678ac3f81e2dc578756871e4d00c19191daf # pin@v45.0.4
         with:
           files: |
             .changeset/**
